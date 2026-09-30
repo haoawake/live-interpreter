@@ -1,0 +1,4 @@
+sherpa-onnx==1.13.8
+numpy>=1.24
+pyaudiowpatch==0.2.12.8
+soundcard==0.4.6

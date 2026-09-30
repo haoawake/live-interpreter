@@ -1,0 +1,10 @@
+# 术语表：每行一条「英文 = 中文」，句子里出现该英文时会强制按这里翻译。
+# 大小写不敏感，复数（-s/-es）和连字符/空格写法都会匹配。保存后立即生效。
+# 以 # 开头的行是注释。
+
+transformer = Transformer
+self-attention = 自注意力
+fine-tuning = 微调
+# token = token
+# prompt = 提示词
+# embedding = 嵌入向量

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+build/
+_internal/
+/同声传译.exe
+bin/
+models/
+downloads/
+logs/
+transcripts/
+config.json
+*.lnk
