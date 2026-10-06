@@ -253,6 +253,8 @@ class App:
         self._hover = False
         self._apply_fonts()
         if MAC:
+            if self.cfg["float_fullscreen"]:
+                plat.set_float_fullscreen(True)  # before the window is first shown
             r.deiconify()  # new_root() kept it hidden until it was borderless
         r.after(50, self._make_app_window)
         r.after(300, self._hover_tick)
@@ -616,6 +618,10 @@ class App:
             self.engine.load_asr()
         elif key in ("translate", "mt", "mt_gpu"):
             self.engine.restart_mt()
+        elif key == "float_fullscreen":
+            plat.set_float_fullscreen(value)
+            self.root.withdraw()  # re-show so the window server re-evaluates its Spaces
+            self.root.after(100, self.restore)
         self._apply_fonts()
         self._update_status()
 
@@ -735,6 +741,11 @@ class App:
                 sub.add_radiobutton(label=name or fmt.format(val), value=val, variable=v,
                                     command=lambda k=key, x=val: self._set(k, x))
             disp.add_cascade(label=label, menu=sub)
+        if MAC:
+            disp.add_separator()
+            disp.add_checkbutton(label="在全屏播放的视频上也显示字幕（隐藏程序坞图标）",
+                                 variable=self._var("float_fullscreen", tk.BooleanVar),
+                                 command=lambda: self._set("float_fullscreen", not self.cfg["float_fullscreen"]))
         m.add_cascade(label="显示", menu=disp)
 
         m.add_separator()

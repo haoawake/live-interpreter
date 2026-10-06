@@ -58,6 +58,16 @@ jobs:
         run: |
           set -o pipefail
           python -m unittest discover -s tests -v 2>&1 | tee "$OUT/02-unittest.log"
+          python - <<'EOF' 2>&1 | tee "$OUT/02-onnxruntime.log"
+          import ctypes, glob, os, site, ssl
+          for p in sorted(set(glob.glob(os.path.join(site.getsitepackages()[0], "**", "libonnxruntime*.dylib"), recursive=True))):
+              class Base(ctypes.Structure):
+                  _fields_ = [("GetApi", ctypes.c_void_p), ("GetVersionString", ctypes.CFUNCTYPE(ctypes.c_char_p))]
+              lib = ctypes.CDLL(p)
+              lib.OrtGetApiBase.restype = ctypes.POINTER(Base)
+              print("onnxruntime", lib.OrtGetApiBase().contents.GetVersionString().decode(), p)
+          print(ssl.OPENSSL_VERSION)
+          EOF
 
       - name: build the app
         id: build
@@ -324,9 +334,12 @@ jobs:
         timeout-minutes: 8
         run: |
           set +e -o pipefail
-          for variant in panel accessory; do
+          for variant in regular accessory accessory-1000; do
             d="$OUT/shots-fs-$variant"; mkdir -p "$d" && echo 30 > "$d/times.txt"
-            [ $variant = accessory ] && export LT_ACCESSORY=1
+            float=false; [ $variant != regular ] && float=true
+            # the microphone as source, so no system-audio prompt covers the screen
+            printf '{"source": "mic:default", "float_fullscreen": %s}' $float > "$DATA/config.json"
+            if [ $variant = accessory-1000 ]; then export LT_WINDOW_LEVEL=1000; else unset LT_WINDOW_LEVEL; fi
             "$APP/Contents/MacOS/LiveInterpreter" --shot "$d" > "$d/app.log" 2>&1 &
             app=$!
             sleep 8
@@ -346,6 +359,7 @@ jobs:
             wait $app
             kill $fs 2>/dev/null; sleep 3
           done
+          unset LT_WINDOW_LEVEL
           true
 
       - name: overlay interaction (synthetic clicks and drags)
@@ -354,7 +368,7 @@ jobs:
         timeout-minutes: 5
         run: |
           set +e -o pipefail
-          unset LT_ACCESSORY
+          printf '{"source": "mic:default"}' > "$DATA/config.json"
           d="$OUT/shots-ui"; mkdir -p "$d" && echo 18,30 > "$d/times.txt"
           "$APP/Contents/MacOS/LiveInterpreter" --shot "$d" > "$d/app.log" 2>&1 &
           app=$!
@@ -405,8 +419,10 @@ jobs:
           L = json.load(open(os.path.join(d, "layout.json")))
           for name in ("live-1", "live-2"):
               s = json.load(open(os.path.join(d, name + ".json")))
-              print(name, "pause:", s["pause"], "font:", s["font_size"], "rect:", s["rect"], "was:", L["window"])
+              print(name, "pause:", s["pause"], "font:", s["font_size"], "rect:", s["rect"], "was:", L["window"],
+                    "styleMask:", s["window"].get("styleMask"))
           EOF
+          rm -f "$DATA/config.json"
 
       - name: collect logs
         if: always()

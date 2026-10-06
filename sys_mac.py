@@ -213,15 +213,19 @@ def new_root(tk):
 
 
 def borderless(root):
-    """A borderless *panel* that does not activate the app when clicked: unlike an ordinary
-    (overrideredirect) window, macOS lets such a panel float over other apps' full-screen
-    Spaces, so the captions stay on top of a full-screen video. Must run before mapping."""
+    root.overrideredirect(True)
+
+
+def set_float_fullscreen(on):
+    """Other apps' full-screen Spaces only admit windows of "accessory" apps, i.e. apps
+    without a Dock icon or menu bar. Opt-in, because then the overlay's own right-click
+    menu is the only way to the settings."""
     try:
-        root.tk.call("::tk::unsupported::MacWindowStyle", "style", root._w, "utility",
-                     "noTitleBar nonActivating canJoinAllSpaces doesNotHide doesNotCycle")
+        send(nsapp(), "setActivationPolicy:", 1 if on else 0, argtypes=[c_long], restype=c_bool)
+        if not on:
+            activate()  # a regular app again: bring back its menu bar
     except Exception:
-        log.exception("utility panel style failed, falling back to overrideredirect")
-        root.overrideredirect(True)
+        log.exception("activation policy change failed")
 
 
 def make_app_window(root):
@@ -234,12 +238,9 @@ def make_app_window(root):
     try:
         # CanJoinAllSpaces | Stationary | IgnoresCycle | FullScreenAuxiliary
         send(win, "setCollectionBehavior:", 1 | 16 | 64 | 256, argtypes=[c_ulong], restype=None)
-        send(win, "setLevel:", 25, argtypes=[c_long], restype=None)  # NSStatusWindowLevel
+        level = int(os.environ.get("LT_WINDOW_LEVEL") or 25)  # NSStatusWindowLevel; env: CI experiment
+        send(win, "setLevel:", level, argtypes=[c_long], restype=None)
         send(win, "setHasShadow:", True, argtypes=[c_bool], restype=None)
-        if send(win, "respondsToSelector:", _objc.sel_registerName(b"setHidesOnDeactivate:"), restype=c_bool):
-            send(win, "setHidesOnDeactivate:", False, argtypes=[c_bool], restype=None)  # panels hide by default
-        if os.environ.get("LT_ACCESSORY") == "1":  # experiment: no Dock icon / menu bar
-            send(nsapp(), "setActivationPolicy:", 1, argtypes=[c_long], restype=c_bool)
     except Exception:
         log.exception("window level setup failed")
     return win
