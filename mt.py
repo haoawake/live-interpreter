@@ -1,5 +1,4 @@
 """English -> Chinese translation with Tencent HY-MT1.5 served by llama.cpp."""
-import ctypes
 import http.client
 import json
 import logging
@@ -7,10 +6,15 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import time
-from ctypes import wintypes
 
 import config
+
+if sys.platform == "darwin":
+    import sys_mac as plat
+else:
+    import sys_win as plat
 
 log = logging.getLogger(__name__)
 
@@ -18,38 +22,6 @@ _PLAIN = "将以下文本翻译为中文，注意只需要输出翻译后的结�
 _TERMS = "参考下面的翻译：\n{terms}\n\n将以下文本翻译为中文，注意只需要输出翻译后的结果，不要额外解释：\n{text}"
 _COMPLETE = re.compile(r"[.!?…][\"')\]]*$")
 _ELLIPSIS = re.compile(r"\s*(?:…|\.{3}|。{3})+$")
-
-
-class _IoCounters(ctypes.Structure):
-    _fields_ = [(n, ctypes.c_ulonglong) for n in
-                ("Read", "Write", "Other", "ReadBytes", "WriteBytes", "OtherBytes")]
-
-
-class _BasicLimits(ctypes.Structure):
-    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
-                ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
-                ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
-                ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
-                ("SchedulingClass", wintypes.DWORD)]
-
-
-class _ExtendedLimits(ctypes.Structure):
-    _fields_ = [("BasicLimitInformation", _BasicLimits), ("IoInfo", _IoCounters),
-                ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
-                ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
-
-
-def _kill_with_parent(proc):
-    """Put `proc` in a job that Windows kills when this process exits, even on a crash,
-    so a llama-server never lingers holding VRAM."""
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    k32.CreateJobObjectW.restype = wintypes.HANDLE
-    job = k32.CreateJobObjectW(None, None)
-    info = _ExtendedLimits()
-    info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    k32.SetInformationJobObject(wintypes.HANDLE(job), 9, ctypes.byref(info), ctypes.sizeof(info))
-    k32.AssignProcessToJobObject(wintypes.HANDLE(job), wintypes.HANDLE(int(proc._handle)))
-    return job  # the handle must stay open for as long as we live
 
 
 def _free_port():
@@ -72,16 +44,20 @@ class LlamaServer:
         self._log = open(os.path.join(config.LOG_DIR, "llama-server.log"), "wb")
         self.port = _free_port()
         exe = os.path.normpath(os.path.join(config.APP_DIR, config.LLAMA_SERVER))
+        if config.MAC:  # Apple silicon: Metal on the GPU, or the performance cores
+            threads = str(min(4, config.CPU_CORES) if self.gpu else config.CPU_CORES)
+        else:
+            threads = "4" if self.gpu else "8"
         args = [exe, "-m", self.model_file, "--host", "127.0.0.1", "--port", str(self.port),
                 "-c", "4096", "-np", "2", "-fa", "auto", "--no-ui",
-                "-ngl", "99" if self.gpu else "0", "-t", "4" if self.gpu else "8"]
+                "-ngl", "99" if self.gpu else "0", "-t", threads]
         log.info("starting %s", " ".join(args))
         self.proc = subprocess.Popen(args, cwd=config.APP_DIR, stdout=self._log, stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+                                     stdin=subprocess.DEVNULL, creationflags=plat.NO_WINDOW)
         try:
-            self._job = _kill_with_parent(self.proc)
+            self._job = plat.kill_with_parent(self.proc)
         except Exception:
-            log.exception("job object setup failed")
+            log.exception("kill-with-parent setup failed")
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.proc.poll() is not None:
@@ -101,6 +77,11 @@ class LlamaServer:
         if self.proc and self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait(timeout=5)
+        if isinstance(self._job, subprocess.Popen):  # the macOS watchdog quits with llama-server
+            try:
+                self._job.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._job.kill()
         if self._log:
             self._log.close()
 

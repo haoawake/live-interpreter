@@ -133,7 +133,7 @@ class Engine:
             except Exception as e:
                 log.exception("ASR load failed")
                 self.events.put(("status", "asr", "识别模型加载失败"))
-                self.events.put(("error", f"识别模型加载失败：{e}（请运行 install.bat）"))
+                self.events.put(("error", f"识别模型加载失败：{e}"))
                 return
             if self.asr is None:
                 self.asr = asr
@@ -171,7 +171,7 @@ class Engine:
                     self.events.put(("error", f"翻译引擎启动失败：{e}"))
                     return
                 self.server, self.translator = server, translator
-                self.events.put(("status", "mt", f"翻译就绪 · {'GPU' if server.gpu else 'CPU'}"))
+                self.events.put(("status", "mt", f"翻译就绪 · {config.GPU_NAME if server.gpu else 'CPU'}"))
         threading.Thread(target=run, daemon=True).start()
 
     # ---- ASR loop --------------------------------------------------------
@@ -269,7 +269,8 @@ class Engine:
                 cap = self.capture
                 self.events.put(("stats", {
                     "asr_ms": asr.decode_ms, "mt_ms": self.mt_ms,
-                    "device": getattr(cap, "device_name", ""), "audio_error": getattr(cap, "error", None)}))
+                    "device": getattr(cap, "device_name", ""), "audio_error": getattr(cap, "error", None),
+                    "audio_problem": getattr(cap, "problem", None), "audio_notice": getattr(cap, "notice", None)}))
                 last_stats = now
 
     def _flush(self, seg, text):
@@ -359,26 +360,37 @@ class Engine:
                 self._transcript.write(f"           {zh}\n")
 
 
-def _main():
-    """Headless run for testing: python engine.py --wav lecture.wav"""
+def main(argv=None):
+    """Headless run for testing: python engine.py --wav lecture.wav
+
+    The packaged app accepts the same arguments (同声传译.exe / Contents/MacOS/LiveInterpreter --wav ...).
+    """
     import argparse
     import sys
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wav", required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--wav", help="16-bit WAV played into the pipeline in real time")
+    src.add_argument("--listen", type=float, metavar="SECONDS",
+                     help="capture the saved audio source (system audio by default) for this long")
     ap.add_argument("--asr", default="160")
     ap.add_argument("--mt", default="q4")
     ap.add_argument("--cpu", action="store_true", help="translate on CPU")
     ap.add_argument("--no-mt", action="store_true")
     ap.add_argument("--all-events", action="store_true", help="also print live/streaming updates")
-    args = ap.parse_args()
-    wav = os.path.abspath(args.wav)
+    ap.add_argument("--threads", type=int, help="ASR threads (default: the saved setting)")
+    args = ap.parse_args(argv)
+    wav = os.path.abspath(args.wav) if args.wav else None
     os.chdir(config.APP_DIR)
-    sys.stdout.reconfigure(encoding="utf-8")
+    config.ensure_glossary()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
     cfg = config.load()
     cfg.update(asr=args.asr, mt=args.mt, mt_gpu=not args.cpu, translate=not args.no_mt, save_transcript=False)
+    if args.threads:
+        cfg["asr_threads"] = args.threads
     events = queue.Queue()
     eng = Engine(cfg, events)
     eng.start(source=False)
@@ -394,10 +406,11 @@ def _main():
             raise SystemExit("engine did not become ready")
     print(f"ready in {time.perf_counter() - t_ready:.1f}s")
 
-    eng.set_source("file:" + wav)
+    eng.set_source("file:" + wav if wav else cfg["source"])
     t0 = time.perf_counter()
-    finals = {}
+    finals, translated = {}, set()
     finished_at = None
+    last_stats = None
     while True:
         try:
             e = events.get(timeout=0.05)
@@ -405,10 +418,13 @@ def _main():
             e = None
         t = time.perf_counter() - t0
         cap = eng.capture
-        if finished_at is None and isinstance(cap, FileSource) and cap.finished.is_set():
+        if finished_at is None and (isinstance(cap, FileSource) and cap.finished.is_set()
+                                    or args.listen and t > args.listen):
             finished_at = t
             print(f"{t:6.2f}s  [audio ended]")
-        if finished_at is not None and t - finished_at > 4 and eng._final_q.empty():
+        # done once every committed sentence has its translation (the runner's VM is slow)
+        if finished_at is not None and t - finished_at > 4 and (
+                len(translated) >= len(finals) or not cfg["translate"] or t - finished_at > 180):
             break
         if e is None:
             continue
@@ -417,6 +433,7 @@ def _main():
             finals[e[1]] = (t, e[3])
             print(f"{t:6.2f}s  FINAL#{e[1]}  {e[3]}")
         elif kind == "final_zh" and e[3]:
+            translated.add(e[1])
             print(f"{t:6.2f}s  ZH#{e[1]} (+{e[4]:.0f}ms)  {e[2]}")
         elif kind == "live" and args.all_events:
             print(f"{t:6.2f}s  live  {e[2]}")
@@ -425,10 +442,13 @@ def _main():
                 print(f"{t:6.2f}s  live_zh  {e[3]}")
         elif kind in ("error", "status"):
             print(f"{t:6.2f}s  {e}")
-        elif kind == "stats" and args.all_events:
-            print(f"{t:6.2f}s  stats {e[1]}")
+        elif kind == "stats":
+            key = tuple(e[1].get(k) for k in ("device", "audio_error", "audio_problem"))
+            if args.all_events or (args.listen and key != last_stats):
+                print(f"{t:6.2f}s  stats {e[1]}")
+            last_stats = key
     eng.shutdown()
 
 
 if __name__ == "__main__":
-    _main()
+    main()

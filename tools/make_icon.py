@@ -1,5 +1,10 @@
-"""Draws assets/icon.ico (+ icon.png preview). Run: .venv\\Scripts\\python.exe tools\\make_icon.py"""
+"""Draws assets/icon.ico (+ icon.png preview). Run: .venv\\Scripts\\python.exe tools\\make_icon.py
+
+    --mac   only write assets/icon-mac.png, the 1024 px master build.py turns into the
+            macOS .icns (drawn here because the fonts are Windows ones)
+"""
 import os
+import sys
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -60,8 +65,29 @@ def simple(size=512):
     return img
 
 
+def mac(size=1024):
+    """Apple's icon grid: the tile is 824 of 1024 px with a soft shadow below it, so the
+    icon sits the same size as the system's own in the Dock and Finder."""
+    from PIL import ImageFilter
+
+    body = round(size * 824 / 1024)
+    tile = detailed(1024).resize((round(body * 1024 / 912),) * 2, Image.LANCZOS)  # detailed() is 912 px of 1024
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    shadow = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    off = (size - tile.width) // 2
+    alpha = tile.getchannel("A").point(lambda a: a * 0.32)
+    shadow.paste((0, 0, 0, 255), (off, off + round(size * 0.012)), alpha)
+    img = Image.alpha_composite(img, shadow.filter(ImageFilter.GaussianBlur(size * 0.012)))
+    img.alpha_composite(tile, (off, off))
+    return img
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
+    if "--mac" in sys.argv:
+        mac().save(os.path.join(OUT, "icon-mac.png"))
+        print("wrote", os.path.join(OUT, "icon-mac.png"))
+        return
     big, small = detailed(), simple()
     # 20/40/56/72/96 are what Windows asks for at 125-300% display scaling
     sizes = (256, 128, 96, 72, 64, 56, 48, 40, 32, 24, 20, 16)
