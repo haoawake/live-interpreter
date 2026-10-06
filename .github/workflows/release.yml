@@ -1,0 +1,181 @@
+# 打了 v* 的 tag 就构建并发一个 Release：Windows 和 macOS 两个包都在 Actions 里打。
+#
+#     Windows   live-interpreter-v<版本>-windows-x64.zip   （+ .sha256）
+#     macOS     live-interpreter-v<版本>-macos-arm64.zip   （+ .sha256，内含 同声传译.app，仅 Apple 芯片）
+#
+# **资产名不能改。** 工具箱网站按 windows-x64 / macos-arm64 这些字样挑下载包。
+#
+# 版本号唯一的来源是 config.VERSION，和 tag 对不上就不发（windows 那个 job 里拦）。
+# 发布说明取自 CHANGELOG.md 里 `## v<版本>` 那一节。
+#
+# **publish 的门是 `needs.windows.result == 'success'`，不是 needs 默认那套。**
+# needs 里有一个 job 失败，依赖它的 job 就会被静静跳过 —— 就算那个 job 设了
+# continue-on-error 也一样（NEU Helper 的 v3.4.0 / v3.5.0 就是这么"tag 在、Release 没有"的）。
+# 所以 publish 用 `if: always()` 自己判门：Windows 包成了就发；macOS 挂了 run 会是红的，
+# 但 Windows 的包照样发出去，事后补 mac 包即可（重跑这个 tag 的工作流）。
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write          # 建 Release 要写权限
+
+env:
+  PYTHONUTF8: '1'          # runner 控制台不是 UTF-8，构建脚本打印中文会直接报错
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+
+      - name: version must match the tag
+        run: |
+          ver=$(python -c "import config; print(config.VERSION)")
+          echo "config.VERSION = $ver   tag = ${GITHUB_REF_NAME#v}"
+          if [ "$ver" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::config.VERSION says $ver but the tag says $GITHUB_REF_NAME"; exit 1
+          fi
+          grep -q "^## $GITHUB_REF_NAME" CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## $GITHUB_REF_NAME' section"; exit 1; }
+
+      # 和 v1.0.0 本机打包时同一套版本
+      - name: dependencies
+        run: |
+          python -m pip install -r requirements.txt numpy==2.5.3 cffi==2.1.1 pycparser==3.0 \
+            pyinstaller==6.22.3 pyinstaller-hooks-contrib==2026.7
+
+      - name: unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: build
+        run: python build.py --stage dist
+
+      # 解压出来的 exe 真能起来（导入 sherpa-onnx、numpy、WASAPI、Tk 后退出）
+      - name: smoke test
+        run: |
+          python - <<'EOF'
+          import glob, json, os, subprocess, sys, zipfile
+          z = glob.glob("dist/*-windows-x64.zip")[0]
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "fresh")
+          zipfile.ZipFile(z).extractall(dest)
+          exe = os.path.join(dest, "live-interpreter", "同声传译.exe")
+          r = subprocess.run([exe, "--selftest", "selftest.json"], timeout=180, cwd=os.environ["RUNNER_TEMP"])
+          report = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "selftest.json"), encoding="utf-8"))
+          print(json.dumps(report, ensure_ascii=False, indent=1))
+          sys.exit(0 if r.returncode == 0 and report["ok"] else 1)
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-windows
+          path: |
+            dist/*-windows-x64.zip
+            dist/*-windows-x64.zip.sha256
+          if-no-files-found: error
+
+  macos:
+    # 钉死 macos-15（Apple 芯片）：包名里的 arm64 是写死的，latest 哪天换了架构就对不上了
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+
+      - name: dependencies
+        run: |
+          python -m pip install -r requirements.txt numpy==2.5.3 pyinstaller==6.22.3 \
+            pyinstaller-hooks-contrib==2026.7
+
+      - name: unit tests
+        run: python -m unittest discover -s tests -v
+
+      # 编译 Core Audio 助手、生成 .icns、PyInstaller 打 .app、写 Info.plist、ad-hoc 签名、ditto 打包
+      - name: build
+        run: python build.py --stage dist
+
+      # 用户拿到的是 zip：解压到新目录，验签名，再让里面的程序自检一遍
+      - name: verify the zip
+        run: |
+          rm -rf "$RUNNER_TEMP/fresh" && mkdir -p "$RUNNER_TEMP/fresh"
+          ditto -x -k dist/*-macos-arm64.zip "$RUNNER_TEMP/fresh"
+          app="$RUNNER_TEMP/fresh/同声传译.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          plutil -p "$app/Contents/Info.plist"
+          "$app/Contents/MacOS/LiveInterpreter" --selftest "$RUNNER_TEMP/selftest.json"
+          cat "$RUNNER_TEMP/selftest.json"
+          python -c "import json,sys; sys.exit(0 if json.load(open('$RUNNER_TEMP/selftest.json'))['ok'] else 1)"
+          du -sh "$app"; ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-macos
+          path: |
+            dist/*-macos-arm64.zip
+            dist/*-macos-arm64.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [windows, macos]
+    # **always() 加自己判门**，理由见文件开头
+    if: always() && github.ref_type == 'tag' && needs.windows.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 不写 name = 所有 artifact 各一个子目录；macos 挂了就只有 Windows 的
+      - uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          path: dl
+
+      - name: release notes from CHANGELOG.md
+        run: |
+          python3 - <<'EOF'
+          import os, re
+          tag = os.environ["GITHUB_REF_NAME"]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"^## {re.escape(tag)}\b.*?$(.*?)(?=^## |\Z)", text, re.M | re.S)
+          body = m.group(1).strip() if m else ""
+          if len(body) < 20:
+              raise SystemExit(f"CHANGELOG.md has no usable section for {tag}")
+          open("release-body.md", "w", encoding="utf-8").write(body + "\n")
+          print(body)
+          EOF
+
+      # 用 runner 预装的 gh。--draft=false 不能省：删掉重打 tag 时 GitHub 会把原来的 Release
+      # 变成草稿，不显式发布的话它就一直对外不可见。
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          mapfile -t files < <(find dl -type f \( -name '*.zip' -o -name '*.sha256' \) | sort)
+          printf 'attaching: %s\n' "${files[@]}"
+          printf '%s\n' "${files[@]}" | grep -q 'windows-x64\.zip$' || { echo "::error::no Windows zip"; exit 1; }
+          printf '%s\n' "${files[@]}" | grep -q 'macos-arm64\.zip$' || echo "::warning::no macOS zip - that build failed"
+          title="同声传译 $tag"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "$title" --notes-file release-body.md --draft=false --prerelease=false --latest
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" --title "$title" --notes-file release-body.md "${files[@]}"
+          fi
+          got=$(gh release view "$tag" --json isDraft,assets --jq '"\(.isDraft) \(.assets|length)"')
+          echo "isDraft / assets = $got"
+          read -r draft assets <<< "$got"
+          if [ "$draft" != "false" ] || [ "$assets" -lt 2 ]; then
+            echo "::error::release is not in the state we wanted ($got)"; exit 1
+          fi

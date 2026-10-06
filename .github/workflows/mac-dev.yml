@@ -1,0 +1,434 @@
+# Temporary (mac-port branch only): build and test on real macOS / Windows runners and
+# publish every log and screenshot to the ci-results branch. Removed before merging.
+name: mac-dev
+
+on:
+  push:
+    branches: [mac-port]
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  mac:
+    runs-on: macos-15
+    timeout-minutes: 75
+    env:
+      OUT: ${{ github.workspace }}/out/mac
+      APP: ${{ github.workspace }}/dist/同声传译.app
+      DATA: /Users/runner/Library/Application Support/同声传译
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+
+      - name: environment
+        id: env
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p "$OUT"
+          {
+            sw_vers; uname -a; sysctl -n machdep.cpu.brand_string hw.memsize hw.perflevel0.physicalcpu hw.ncpu
+            xcrun swiftc --version; xcodebuild -version
+            python -c "import sys, tkinter; print(sys.version); r = tkinter.Tcl(); print('tcl', r.eval('info patchlevel'))"
+            python -c "import _tkinter, sys; print(_tkinter.__file__)"
+            otool -L "$(python -c 'import _tkinter; print(_tkinter.__file__)')"
+            system_profiler SPDisplaysDataType SPAudioDataType
+          } 2>&1 | tee "$OUT/00-environment.log"
+
+      - name: dependencies
+        run: |
+          set -o pipefail
+          mkdir -p "$OUT"
+          python -m pip install --upgrade pip 2>&1 | tail -1
+          python -m pip install -r requirements.txt numpy==2.5.3 pyinstaller==6.22.3 \
+            pyinstaller-hooks-contrib==2026.7 2>&1 | tee "$OUT/01-pip.log"
+          python -m pip list 2>&1 | tee -a "$OUT/01-pip.log"
+
+      - name: unit tests
+        id: unit
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -v 2>&1 | tee "$OUT/02-unittest.log"
+
+      - name: build the app
+        id: build
+        run: |
+          set -o pipefail
+          python build.py --stage dist 2>&1 | tee "$OUT/03-build.log"
+
+      - name: inspect the bundle
+        id: inspect
+        continue-on-error: true
+        run: |
+          set +e -o pipefail
+          {
+            ls -la dist
+            du -sh "$APP" dist/*.zip
+            cat dist/*.sha256
+            plutil -p "$APP/Contents/Info.plist"
+            find "$APP/Contents" -maxdepth 2 | sort
+            ls -la "$APP/Contents/MacOS"
+            find "$APP/Contents/Resources" -maxdepth 1 | sort
+            codesign -dv --verbose=2 "$APP"
+            codesign --verify --deep --strict --verbose=2 "$APP" && echo "CODESIGN OK"
+            spctl -a -vv "$APP" || true
+            file "$APP/Contents/MacOS/"*
+            vtool -show-build "$APP/Contents/MacOS/lt-audio"
+          } 2>&1 | tee "$OUT/04-bundle.log"
+          du -sh "$APP" | cut -f1 > "$OUT/bundle-size.txt"
+          ls -l dist/*.zip >> "$OUT/bundle-size.txt"
+
+      - name: launch from the extracted zip (selftest)
+        id: selftest
+        continue-on-error: true
+        run: |
+          set +e -o pipefail
+          rm -rf "$RUNNER_TEMP/fresh-zip" && mkdir -p "$RUNNER_TEMP/fresh-zip"
+          ditto -x -k dist/*-macos-arm64.zip "$RUNNER_TEMP/fresh-zip"
+          X="$RUNNER_TEMP/fresh-zip/同声传译.app"
+          {
+            ls -la "$RUNNER_TEMP/fresh-zip"
+            codesign --verify --deep --strict --verbose=2 "$X" && echo "CODESIGN OK (extracted)"
+            "$X/Contents/MacOS/LiveInterpreter" --selftest "$OUT/selftest.json"; echo "selftest exit $?"
+            cat "$OUT/selftest.json"
+          } 2>&1 | tee "$OUT/05-selftest.log"
+          python -c "import json,sys; sys.exit(0 if json.load(open('$OUT/selftest.json'))['ok'] else 1)"
+
+      - name: first-run window (empty data folder)
+        id: firstrun
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          export LT_DATA_DIR="$RUNNER_TEMP/fresh1" LT_SHOT_SETUP=1
+          mkdir -p "$LT_DATA_DIR"
+          "$APP/Contents/MacOS/LiveInterpreter" --shot "$OUT/shots" 2>&1 | tee "$OUT/06-firstrun.log"
+          cat "$LT_DATA_DIR/logs/app.log" >> "$OUT/06-firstrun.log" || true
+          ls -la "$OUT/shots" || true
+
+      - name: model manifest
+        run: |
+          python - <<'EOF'
+          import json, config
+          json.dump({"asr": config.ASR_MODELS["160"]["url"], "mt": config.MT_MODELS["q4"]["url"]},
+                    open("model-manifest.json", "w"), indent=1)
+          EOF
+          cat model-manifest.json
+
+      - uses: actions/cache/restore@v4
+        id: cache
+        with:
+          path: ~/ltcache/models
+          key: lt-models-${{ hashFiles('model-manifest.json') }}
+
+      - name: models (download on a cache miss)
+        id: models
+        run: |
+          set -o pipefail
+          mkdir -p ~/ltcache/models "$DATA"
+          ln -sfn ~/ltcache/models "$DATA/models"
+          python - <<'EOF' 2>&1 | tee "$OUT/07-models.log"
+          import config, setup_models
+          for key, label, mb in setup_models.needed():
+              if not key.startswith("llama"):
+                  print("downloading", label, flush=True)
+                  setup_models.install(key)
+          print("asr", config.asr_installed(), "mt", config.mt_installed())
+          EOF
+          du -sh ~/ltcache/models/* | tee -a "$OUT/07-models.log"
+
+      - uses: actions/cache/save@v4
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: ~/ltcache/models
+          key: lt-models-${{ hashFiles('model-manifest.json') }}
+
+      - name: first-run download of llama.cpp (packaged app, unattended)
+        id: llama
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          export LT_DATA_DIR="$RUNNER_TEMP/fresh2" LT_SHOT_SETUP=1 LT_AUTOSTART=1
+          mkdir -p "$LT_DATA_DIR" "$OUT/shots-llama"
+          ln -sfn ~/ltcache/models "$LT_DATA_DIR/models"
+          "$APP/Contents/MacOS/LiveInterpreter" --shot "$OUT/shots-llama" 2>&1 | tee "$OUT/08-llama.log"
+          cat "$LT_DATA_DIR/logs/app.log" >> "$OUT/08-llama.log" || true
+          {
+            ls -la "$LT_DATA_DIR/bin/llama"
+            xattr -l "$LT_DATA_DIR/bin/llama/llama-server" || true
+            vtool -show-build "$LT_DATA_DIR/bin/llama/llama-server"
+            "$LT_DATA_DIR/bin/llama/llama-server" --version
+            "$LT_DATA_DIR/bin/llama/llama-server" --list-devices
+          } 2>&1 | tee -a "$OUT/08-llama.log"
+          rm -rf "$DATA/bin" && cp -a "$LT_DATA_DIR/bin" "$DATA/bin"
+
+      - name: English speech sample
+        run: |
+          cat > speech.txt <<'EOF'
+          Good morning, everyone. Today we are going to talk about how neural networks learn to translate.
+          First, the model reads the whole sentence and turns every word into a vector.
+          Then it uses self-attention to decide which words matter most for the next word.
+          This is why transformers replaced the older recurrent models so quickly.
+          Finally, fine-tuning on a small dataset makes the model useful for a specific course.
+          If you have any questions, please raise your hand. Thank you for listening.
+          EOF
+          say -v Samantha -r 170 -o speech.aiff -f speech.txt || say -o speech.aiff -f speech.txt
+          afconvert -f WAVE -d LEI16@16000 -c 1 speech.aiff speech.wav
+          afinfo speech.wav | tee "$OUT/09-speech.log"
+
+      - name: pipeline on the packaged app (CPU)
+        id: cpu
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          set -o pipefail
+          "$APP/Contents/MacOS/LiveInterpreter" --wav speech.wav --cpu 2>"$OUT/10-cpu-stderr.log" | tee "$OUT/10-pipeline-cpu.log"
+          cp "$DATA/logs/llama-server.log" "$OUT/10-llama-server-cpu.log" || true
+          grep -c "ZH#" "$OUT/10-pipeline-cpu.log"
+
+      - name: pipeline on the packaged app (Metal)
+        id: metal
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          set -o pipefail
+          "$APP/Contents/MacOS/LiveInterpreter" --wav speech.wav 2>"$OUT/11-metal-stderr.log" | tee "$OUT/11-pipeline-metal.log"
+          cp "$DATA/logs/llama-server.log" "$OUT/11-llama-server-metal.log" || true
+          grep -c "ZH#" "$OUT/11-pipeline-metal.log"
+
+      - name: llama-server dies with the app (kill -9)
+        id: orphan
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set +e -o pipefail
+          {
+            "$APP/Contents/MacOS/LiveInterpreter" --wav speech.wav --cpu > /dev/null 2>&1 &
+            pid=$!
+            for i in $(seq 1 60); do pgrep -f bin/llama/llama-server > /dev/null && break; sleep 1; done
+            echo "app $pid, llama-server $(pgrep -f bin/llama/llama-server)"
+            ps -o pid,ppid,command -ax | grep -E "llama-server|lt-audio|LiveInterpreter" | grep -v grep || true
+            kill -9 $pid
+            sleep 3
+            if pgrep -f bin/llama/llama-server; then echo "FAIL: llama-server survived"; pkill -9 -f bin/llama/llama-server; exit 1; else echo "OK: llama-server gone"; fi
+          } 2>&1 | tee "$OUT/12-orphan.log"
+
+      - name: audio helper
+        id: helper
+        continue-on-error: true
+        timeout-minutes: 6
+        run: |
+          set +e -o pipefail
+          H="$APP/Contents/MacOS/lt-audio"
+          {
+            echo "== devices"; "$H" devices
+            echo "== tap --no-request while say plays"
+            "$H" tap --no-request > tap.raw 2> tap.err & tp=$!
+            sleep 2; say -v Samantha "Testing the system audio tap. One, two, three, four, five." ; sleep 2
+            kill $tp; wait $tp; echo "tap exit $?"; cat tap.err
+            echo "== tap (with permission request, 20 s)"
+            ( "$H" tap > tap2.raw 2> tap2.err & p=$!; sleep 6; say "Second test of the tap."; sleep 14; kill $p 2>/dev/null; wait $p; echo "exit $?" )
+            cat tap2.err
+            echo "== mic default, 5 s"
+            ( "$H" mic default > mic.raw 2> mic.err & p=$!; sleep 5; kill $p 2>/dev/null; wait $p; echo "exit $?" )
+            cat mic.err
+            python - <<'EOF'
+          import struct, numpy as np
+          for name in ("tap.raw", "tap2.raw", "mic.raw"):
+              data = open(name, "rb").read()
+              pos, n, rates, samples = 0, 0, set(), []
+              while pos + 12 <= len(data):
+                  magic, rate, frames = struct.unpack_from("<4sII", data, pos)
+                  assert magic == b"LTAU", (name, pos)
+                  samples.append(np.frombuffer(data, "<f4", frames, pos + 12))
+                  pos += 12 + frames * 4; n += 1; rates.add(rate)
+              a = np.concatenate(samples) if samples else np.zeros(0)
+              print(f"{name}: {len(data)} bytes, {n} packets, rates {rates}, {a.size} samples, "
+                    f"nonzero {np.count_nonzero(a)}, peak {np.abs(a).max() if a.size else 0:.4f}, "
+                    f"rms {np.sqrt(np.mean(a**2)) if a.size else 0:.5f}")
+          EOF
+            echo "== watchdog"
+            bash -c 'sleep 300 & echo $! > child.pid; exec sleep 3' & parent=$!
+            sleep 1; child=$(cat child.pid)
+            "$H" watchdog $parent $child & wd=$!
+            sleep 5
+            if kill -0 $child 2>/dev/null; then echo "FAIL: child $child alive"; kill $child; else echo "OK: child killed after parent exit"; fi
+            wait $wd; echo "watchdog exit $?"
+            echo "== settings pane anchors"
+            for a in Privacy_AudioCapture Privacy_ScreenCapture Privacy_Microphone; do
+              printf '%s: ' $a; grep -rl "$a" /System/Library/ExtensionKit/Extensions/*.appex/Contents/Info.plist /System/Library/ExtensionKit/Extensions/*Privacy*.appex 2>/dev/null | head -3 | tr '\n' ' '; echo
+            done
+          } 2>&1 | tee "$OUT/13-helper.log"
+
+      - name: overlay with captions (packaged app, test WAV)
+        id: overlay
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          set -o pipefail
+          "$APP/Contents/MacOS/LiveInterpreter" --test-wav speech.wav --shot "$OUT/shots" 2>&1 | tee "$OUT/14-overlay.log"
+          cp "$DATA/logs/app.log" "$OUT/14-app.log" || true
+          ls -la "$OUT/shots"
+
+      - name: overlay over a full-screen app
+        id: fullscreen
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          set +e -o pipefail
+          mkdir -p "$OUT/shots-fs"
+          python - > "$OUT/15-fullscreen-helper.log" 2>&1 <<'EOF' &
+          import tkinter as tk
+          r = tk.Tk()
+          r.title("Full screen test")
+          r.configure(bg="#2d6a4f")
+          tk.Label(r, text="Another app in full screen", font=("Helvetica", 48), bg="#2d6a4f", fg="white").pack(expand=True)
+          r.after(800, lambda: r.attributes("-fullscreen", True))
+          r.after(150000, r.destroy)
+          r.mainloop()
+          EOF
+          fs=$!
+          sleep 6
+          screencapture -x "$OUT/shots-fs/before.png"
+          "$APP/Contents/MacOS/LiveInterpreter" --test-wav speech.wav --shot "$OUT/shots-fs" 2>&1 | tee "$OUT/15-fullscreen.log"
+          kill $fs 2>/dev/null || true
+
+      - name: collect logs
+        if: always()
+        run: |
+          mkdir -p "$OUT/data-logs"
+          cp -R "$DATA/logs/." "$OUT/data-logs/" 2>/dev/null || true
+          cat > "$OUT/STEPS" <<EOF
+          env=${{ steps.env.outcome }}
+          unit=${{ steps.unit.outcome }}
+          build=${{ steps.build.outcome }}
+          inspect=${{ steps.inspect.outcome }}
+          selftest=${{ steps.selftest.outcome }}
+          firstrun=${{ steps.firstrun.outcome }}
+          cache_hit=${{ steps.cache.outputs.cache-hit }}
+          models=${{ steps.models.outcome }}
+          llama=${{ steps.llama.outcome }}
+          cpu=${{ steps.cpu.outcome }}
+          metal=${{ steps.metal.outcome }}
+          orphan=${{ steps.orphan.outcome }}
+          helper=${{ steps.helper.outcome }}
+          overlay=${{ steps.overlay.outcome }}
+          fullscreen=${{ steps.fullscreen.outcome }}
+          EOF
+          cat "$OUT/STEPS"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mac
+          path: out/mac
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      OUT: ${{ github.workspace }}/out/windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+
+      - name: dependencies
+        run: |
+          set -o pipefail
+          mkdir -p "$OUT"
+          python -m pip install -r requirements.txt numpy==2.5.3 cffi==2.1.1 pycparser==3.0 \
+            pyinstaller==6.22.3 pyinstaller-hooks-contrib==2026.7 2>&1 | tee "$OUT/01-pip.log"
+          python -m pip list 2>&1 | tee -a "$OUT/01-pip.log"
+
+      - name: unit tests
+        id: unit
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -v 2>&1 | tee "$OUT/02-unittest.log"
+
+      - name: build the release zip
+        id: build
+        run: |
+          set -o pipefail
+          python build.py --stage dist 2>&1 | tee "$OUT/03-build.log"
+          ls -la dist | tee -a "$OUT/03-build.log"
+          cat dist/*.sha256 | tee -a "$OUT/03-build.log"
+
+      - name: compare with the v1.0.0 asset
+        id: compare
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          curl -sSL -o v100.zip https://github.com/haoawake/live-interpreter/releases/download/v1.0.0/live-interpreter-v1.0.0-windows-x64.zip
+          python - <<'EOF' 2>&1 | tee "$OUT/04-compare.log"
+          import glob, zipfile
+          old = {i.filename: i.file_size for i in zipfile.ZipFile("v100.zip").infolist()}
+          new_zip = glob.glob("dist/*-windows-x64.zip")[0]
+          new = {i.filename: i.file_size for i in zipfile.ZipFile(new_zip).infolist()}
+          print(new_zip, len(new), "files;", "v1.0.0:", len(old), "files")
+          print("top level old:", sorted({n.split("/")[1] for n in old}))
+          print("top level new:", sorted({n.split("/")[1] for n in new}))
+          print("only in v1.0.0:"); [print("  -", n) for n in sorted(set(old) - set(new))]
+          print("only in new:"); [print("  +", n) for n in sorted(set(new) - set(old))]
+          EOF
+
+      - name: smoke test the exe from the extracted zip
+        id: smoke
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python - <<'EOF' 2>&1 | tee "$OUT/05-smoke.log"
+          import glob, json, os, subprocess, sys, zipfile
+          z = glob.glob("dist/*-windows-x64.zip")[0]
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "fresh")
+          zipfile.ZipFile(z).extractall(dest)
+          exe = os.path.join(dest, "live-interpreter", "同声传译.exe")
+          report = os.path.join(os.environ["OUT"], "selftest.json")
+          r = subprocess.run([exe, "--selftest", report], timeout=120)
+          print("exit", r.returncode)
+          data = json.load(open(report, encoding="utf-8"))
+          print(json.dumps(data, ensure_ascii=False, indent=1))
+          sys.exit(0 if r.returncode == 0 and data["ok"] else 1)
+          EOF
+
+      - name: summary
+        if: always()
+        run: |
+          printf 'unit=%s\nbuild=%s\ncompare=%s\nsmoke=%s\n' "${{ steps.unit.outcome }}" "${{ steps.build.outcome }}" \
+            "${{ steps.compare.outcome }}" "${{ steps.smoke.outcome }}" > "$OUT/STEPS"
+          cat "$OUT/STEPS"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows
+          path: out/windows
+
+  report:
+    needs: [mac, windows]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with: { path: out }
+      - run: |
+          cd out
+          printf 'sha=%s\nmac=%s\nwindows=%s\n' "${{ github.sha }}" "${{ needs.mac.result }}" "${{ needs.windows.result }}" > STATUS
+          git init -q -b ci-results && git config user.name ci && git config user.email ci@users.noreply.github.com
+          git add -A && git commit -qm "ci ${{ github.sha }} mac=${{ needs.mac.result }} windows=${{ needs.windows.result }}"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:ci-results

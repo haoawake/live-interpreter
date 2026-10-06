@@ -1,17 +1,35 @@
 """Paths, model registry and persisted user settings."""
 import json
 import os
+import shutil
+import subprocess
 import sys
 
-# Packaged (PyInstaller) the app folder is the one holding 同声传译.exe; from
-# source it is this file's folder. Either way models/, bin/ and config.json live there.
-FROZEN = getattr(sys, "frozen", False)
-APP_DIR = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.abspath(__file__))
-BUNDLE_DIR = getattr(sys, "_MEIPASS", APP_DIR)  # read-only files shipped inside the exe
-ICON_PATH = os.path.join(BUNDLE_DIR, "assets", "icon.ico")
+VERSION = "1.1.0"
+MAC = sys.platform == "darwin"
 APP_NAME = "同声传译"
+BUNDLE_ID = "com.haoawake.live-interpreter"
+FROZEN = getattr(sys, "frozen", False)
+SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+if MAC:
+    # Never inside the .app: it is signed (writing breaks the seal) and, launched from
+    # 下载, App Translocation runs it from a read-only copy. LT_DATA_DIR is for tests.
+    APP_DIR = os.environ.get("LT_DATA_DIR") or os.path.join(
+        os.path.expanduser("~/Library/Application Support"), APP_NAME)
+    os.makedirs(APP_DIR, exist_ok=True)
+else:
+    # Packaged (PyInstaller) the app folder is the one holding 同声传译.exe; from
+    # source it is this file's folder. Either way models/, bin/ and config.json live there.
+    APP_DIR = os.path.dirname(sys.executable) if FROZEN else SOURCE_DIR
+BUNDLE_DIR = getattr(sys, "_MEIPASS", SOURCE_DIR)  # read-only files shipped inside the exe / .app
+ICON_PATH = os.path.join(BUNDLE_DIR, "assets", "icon.png" if MAC else "icon.ico")
 EXE_NAME = APP_NAME + ".exe"
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+# macOS: the Core Audio helper sits next to the executable in Contents/MacOS (all
+# Mach-O code must live there to pass codesign); from source it is built by build.py.
+MAC_HELPER = (os.path.join(os.path.dirname(sys.executable), "lt-audio") if FROZEN
+              else os.path.join(SOURCE_DIR, "macos", "build", "lt-audio"))
 
 # Every path below is relative to APP_DIR, and the app chdirs there on startup.
 # sherpa-onnx opens files through the ANSI code page on Windows, so an absolute
@@ -53,15 +71,28 @@ MT_MODELS = {
 
 LLAMA_BUILD = "b11269"
 LLAMA_DIR = "bin/llama"
-LLAMA_SERVER = LLAMA_DIR + "/llama-server.exe"
+LLAMA_SERVER = LLAMA_DIR + ("/llama-server" if MAC else "/llama-server.exe")
 GLOSSARY_PATH = "glossary.txt"
 TRANSCRIPT_DIR = "transcripts"
 LOG_DIR = "logs"
 
+
+def _mac_cores():
+    """Performance cores on Apple silicon (the efficiency cores only slow a decode down)."""
+    try:
+        out = subprocess.run(["sysctl", "-n", "hw.perflevel0.physicalcpu"], capture_output=True,
+                             text=True, timeout=5).stdout
+        return max(1, int(out.strip()))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return max(1, (os.cpu_count() or 4) // 2)
+
+
+CPU_CORES = _mac_cores() if MAC else None
+
 DEFAULTS = {
     "source": "loopback:default",  # see audio.list_sources()
     "asr": "160",
-    "asr_threads": 6,
+    "asr_threads": min(4, CPU_CORES) if MAC else 6,
     "mt": "q4",
     "mt_gpu": True,
     "translate": True,
@@ -89,6 +120,17 @@ def save(cfg):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     os.replace(tmp, CONFIG_PATH)
+
+
+def ensure_glossary():
+    """macOS keeps its data outside the app, so the default glossary is copied out once."""
+    path = os.path.join(APP_DIR, GLOSSARY_PATH)
+    src = os.path.join(BUNDLE_DIR, GLOSSARY_PATH)
+    if MAC and not os.path.exists(path) and os.path.exists(src):
+        try:
+            shutil.copyfile(src, path)
+        except OSError:
+            pass
 
 
 def asr_installed():

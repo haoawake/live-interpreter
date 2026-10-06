@@ -1,4 +1,4 @@
-"""下载识别模型、翻译模型和 llama.cpp，创建快捷方式。可重复运行，已有的会跳过。
+"""下载识别模型、翻译模型和 llama.cpp，创建快捷方式（仅 Windows）。可重复运行，已有的会跳过。
 
 程序第一次运行时会自动调用这里，在窗口里显示进度。命令行用法（开发用）：
     python setup_models.py           默认组件
@@ -8,6 +8,7 @@
 import argparse
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -20,14 +21,30 @@ import config
 
 os.chdir(config.APP_DIR)
 DOWNLOADS = "downloads"
-NO_WINDOW = subprocess.CREATE_NO_WINDOW  # the packaged app has no console to borrow
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # the packaged app has no console to borrow
 _UA = {"User-Agent": "live-translate-setup"}
 _HF, _HF_MIRROR = "https://huggingface.co/", "https://hf-mirror.com/"
+
+
+def _ssl_context():
+    """python.org's macOS Python has no CA store of its own (the frozen app even less so):
+    use certifi's. Windows Python reads the system store."""
+    if not config.MAC:
+        return None
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return None
+
+
+_SSL = _ssl_context()
 _GH = f"https://github.com/ggml-org/llama.cpp/releases/download/{config.LLAMA_BUILD}/"
 LLAMA_BUILDS = {  # flavor -> (label, MB, archives)
     "cuda": ("NVIDIA 显卡版", 550, [_GH + f"llama-{config.LLAMA_BUILD}-bin-win-cuda-13.4-x64.zip",
                                    _GH + "cudart-llama-bin-win-cuda-13.4-x64.zip"]),
     "vulkan": ("通用显卡版", 32, [_GH + f"llama-{config.LLAMA_BUILD}-bin-win-vulkan-x64.zip"]),
+    "metal": ("Apple 芯片版", 12, [_GH + f"llama-{config.LLAMA_BUILD}-bin-macos-arm64.tar.gz"]),
 }
 
 
@@ -42,6 +59,8 @@ def nvidia_driver_major():
 
 
 def llama_flavor():
+    if config.MAC:
+        return "metal"  # Apple silicon only; the build runs on the GPU (Metal) or the CPU
     # The CUDA 13 build needs an R580+ driver; everything else (AMD, Intel, older
     # NVIDIA drivers) gets the Vulkan build.
     major = nvidia_driver_major()
@@ -76,8 +95,11 @@ def install(key, progress=None, mirror=False):
             archive = _fetch_archive(url, progress, mirror)
             if progress:
                 progress(0, 0, "unpack")
-            with zipfile.ZipFile(archive) as z:
-                z.extractall(config.LLAMA_DIR)
+            if archive.endswith(".tar.gz"):
+                _extract_flat(archive, config.LLAMA_DIR)
+            else:
+                with zipfile.ZipFile(archive) as z:
+                    z.extractall(config.LLAMA_DIR)
             os.remove(archive)
     elif kind == "asr":
         m = config.ASR_MODELS[name]
@@ -94,6 +116,24 @@ def install(key, progress=None, mirror=False):
         os.rmdir(DOWNLOADS)
 
 
+def _extract_flat(archive, dest):
+    """The macOS build is llama-bNNNN/{llama-server, lib*.dylib, ...} with the dylib
+    version symlinks, which zipfile could not recreate; tarfile keeps them and the
+    executable bits. The top folder is dropped so the server lands in bin/llama/."""
+    os.makedirs(dest, exist_ok=True)
+    with tarfile.open(archive, "r:gz") as tar:
+        members = []
+        for m in tar.getmembers():
+            parts = m.name.split("/", 1)
+            if len(parts) < 2 or not parts[1]:
+                continue
+            m.name = parts[1]
+            members.append(m)
+        tar.extractall(dest, members=members, filter="data")
+    if config.MAC:  # never let Gatekeeper second-guess binaries we fetched ourselves
+        subprocess.run(["xattr", "-dr", "com.apple.quarantine", dest], capture_output=True)
+
+
 def _fetch_archive(url, progress, mirror):
     path = os.path.join(DOWNLOADS, url.rsplit("/", 1)[1])
     if not os.path.exists(path):
@@ -104,7 +144,7 @@ def _fetch_archive(url, progress, mirror):
 def _remote_size(url):
     try:
         req = urllib.request.Request(url, method="HEAD", headers=_UA)
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=20, context=_SSL) as r:
             return int(r.headers.get("Content-Length") or 0) or None
     except Exception:
         return None
@@ -155,7 +195,8 @@ def _download_one(url, dest, progress, attempts=5):
         have = os.path.getsize(part) if os.path.exists(part) else 0
         headers = dict(_UA, Range=f"bytes={have}-") if have else _UA
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60,
+                                        context=_SSL) as r:
                 if have and r.status != 206:  # server ignored the range: start over
                     have = 0
                 total = have + int(r.headers.get("Content-Length") or 0)
@@ -189,7 +230,11 @@ def _download_one(url, dest, progress, attempts=5):
 
 
 def create_shortcuts(where=("Desktop", "Programs")):
-    """同声传译.lnk on the desktop / in the Start menu. Returns the paths created."""
+    """同声传译.lnk on the desktop / in the Start menu. Returns the paths created.
+
+    Windows only: on macOS the app lives in 应用程序 and Launchpad/Spotlight find it."""
+    if config.MAC:
+        return []
     exe = sys.executable if config.FROZEN else os.path.join(config.APP_DIR, config.EXE_NAME)
     if os.path.exists(exe):
         target, args, icon = exe, "", exe + ",0"
@@ -215,7 +260,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--all", action="store_true", help="也下载「精准」识别模型和 Q6_K 翻译模型")
     ap.add_argument("--mirror", action="store_true", help="HuggingFace 走 hf-mirror.com")
-    ap.add_argument("--llama", choices=("cuda", "vulkan"), help="默认自动检测显卡")
+    ap.add_argument("--llama", choices=tuple(LLAMA_BUILDS), help="默认自动检测显卡")
     args = ap.parse_args()
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")

@@ -10,3 +10,4 @@ logs/
 transcripts/
 config.json
 *.lnk
+dist/

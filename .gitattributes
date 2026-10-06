@@ -5,3 +5,6 @@
 *.txt text eol=lf
 *.png binary
 *.ico binary
+*.swift text eol=lf
+*.yml text eol=lf
+*.sh text eol=lf

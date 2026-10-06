@@ -133,7 +133,7 @@ class Engine:
             except Exception as e:
                 log.exception("ASR load failed")
                 self.events.put(("status", "asr", "识别模型加载失败"))
-                self.events.put(("error", f"识别模型加载失败：{e}（请运行 install.bat）"))
+                self.events.put(("error", f"识别模型加载失败：{e}"))
                 return
             if self.asr is None:
                 self.asr = asr
@@ -269,7 +269,8 @@ class Engine:
                 cap = self.capture
                 self.events.put(("stats", {
                     "asr_ms": asr.decode_ms, "mt_ms": self.mt_ms,
-                    "device": getattr(cap, "device_name", ""), "audio_error": getattr(cap, "error", None)}))
+                    "device": getattr(cap, "device_name", ""), "audio_error": getattr(cap, "error", None),
+                    "audio_problem": getattr(cap, "problem", None), "audio_notice": getattr(cap, "notice", None)}))
                 last_stats = now
 
     def _flush(self, seg, text):
@@ -359,8 +360,11 @@ class Engine:
                 self._transcript.write(f"           {zh}\n")
 
 
-def _main():
-    """Headless run for testing: python engine.py --wav lecture.wav"""
+def main(argv=None):
+    """Headless run for testing: python engine.py --wav lecture.wav
+
+    The packaged app accepts the same arguments (同声传译.exe / Contents/MacOS/LiveInterpreter --wav ...).
+    """
     import argparse
     import sys
 
@@ -371,14 +375,18 @@ def _main():
     ap.add_argument("--cpu", action="store_true", help="translate on CPU")
     ap.add_argument("--no-mt", action="store_true")
     ap.add_argument("--all-events", action="store_true", help="also print live/streaming updates")
-    args = ap.parse_args()
+    ap.add_argument("--threads", type=int, help="ASR threads (default: the saved setting)")
+    args = ap.parse_args(argv)
     wav = os.path.abspath(args.wav)
     os.chdir(config.APP_DIR)
-    sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
     cfg = config.load()
     cfg.update(asr=args.asr, mt=args.mt, mt_gpu=not args.cpu, translate=not args.no_mt, save_transcript=False)
+    if args.threads:
+        cfg["asr_threads"] = args.threads
     events = queue.Queue()
     eng = Engine(cfg, events)
     eng.start(source=False)
@@ -431,4 +439,4 @@ def _main():
 
 
 if __name__ == "__main__":
-    _main()
+    main()
