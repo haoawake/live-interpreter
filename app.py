@@ -183,7 +183,7 @@ class App:
     def _build(self):
         r = self.root
         r.title("同声传译")
-        r.overrideredirect(True)
+        plat.borderless(r)
         r.attributes("-topmost", True)
         r.attributes("-alpha", self.cfg["opacity"])
         r.configure(bg=BG)
@@ -779,6 +779,7 @@ class App:
             info = {"window": plat.window_info(plat.ns_window(widget or self.root)), "rect": self._rect(),
                     "entries": [(e.en, e.zh) for e in self.entries], "live": [self.live_en, self.live_zh],
                     "status": self.status_lbl.cget("text"), "stats": self.stats, "banner": self._banner_for,
+                    "pause": self.pause_btn.cget("text"), "font_size": self.cfg["font_size"],
                     "menus": plat.menu_titles() if hasattr(plat, "menu_titles") else None}
             with open(os.path.join(self.shot_dir, name + ".json"), "w", encoding="utf-8") as f:
                 json.dump(info, f, ensure_ascii=False, indent=1)
@@ -795,6 +796,9 @@ class App:
             spec = "25,55"
         times = [float(x) for x in spec.split(",")]
         elapsed = time.time() - self._shots_started
+        if elapsed > 3 and not getattr(self, "_layout_written", False):
+            self._layout_written = True
+            self._write_layout()
         taken = getattr(self, "_live_taken", 0)
         if taken < len(times) and elapsed >= times[taken]:
             self._shot(f"live-{taken + 1}")
@@ -803,6 +807,15 @@ class App:
             self.quit()
             return
         self.root.after(500, self._live_shot_tick)
+
+    def _write_layout(self):
+        """Screen coordinates of the overlay and its buttons, for CI's synthetic clicks."""
+        def box(w):
+            return [w.winfo_rootx(), w.winfo_rooty(), w.winfo_width(), w.winfo_height()]
+        layout = {"window": list(self._rect()), "grip": box(self.grip), "text": box(self.text),
+                  "buttons": {b.cget("text"): box(b) for b in self.buttons}}
+        with open(os.path.join(self.shot_dir, "layout.json"), "w", encoding="utf-8") as f:
+            json.dump(layout, f, ensure_ascii=False)
 
     def _shot_tick(self):
         elapsed = time.time() - self._shots_started
@@ -1058,10 +1071,10 @@ def _selftest(path):
 
 def main():
     argv = sys.argv[1:]
-    if "--wav" in argv:  # headless pipeline test, see engine.main()
+    if "--wav" in argv or "--listen" in argv:  # headless pipeline test, see engine.main()
         import engine
-        i = argv.index("--wav") + 1
-        if i < len(argv):
+        if "--wav" in argv and argv.index("--wav") + 1 < len(argv):
+            i = argv.index("--wav") + 1
             argv[i] = os.path.join(_LAUNCH_DIR, argv[i])
         return engine.main(argv)
     ap = argparse.ArgumentParser()

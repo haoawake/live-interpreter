@@ -237,34 +237,6 @@ jobs:
           cp "$DATA/logs/app.log" "$OUT/14-app.log" || true
           ls -la "$OUT/shots"
 
-      - name: overlay stays over an app that goes full screen
-        id: fullscreen
-        continue-on-error: true
-        timeout-minutes: 8
-        run: |
-          set +e -o pipefail
-          mkdir -p "$OUT/shots-fs"
-          # the overlay first (as a user would have it), then another app enters full screen
-          "$APP/Contents/MacOS/LiveInterpreter" --test-wav speech-slow.wav --shot "$OUT/shots-fs" > "$OUT/15-fullscreen.log" 2>&1 &
-          app=$!
-          sleep 12
-          python - > "$OUT/15-fullscreen-helper.log" 2>&1 <<'EOF' &
-          import tkinter as tk
-          r = tk.Tk()
-          r.title("Full screen test")
-          r.configure(bg="#2d6a4f")
-          tk.Label(r, text="Another app in full screen", font=("Helvetica", 48), bg="#2d6a4f", fg="white").pack(expand=True)
-          r.after(500, lambda: r.attributes("-fullscreen", True))
-          r.after(240000, r.destroy)
-          r.mainloop()
-          EOF
-          fs=$!
-          sleep 8
-          screencapture -x "$OUT/shots-fs/fullscreen-now.png"
-          wait $app
-          kill $fs 2>/dev/null
-          true
-
       - name: launched by LaunchServices (permission prompt names the app)
         id: lsprompt
         continue-on-error: true
@@ -276,9 +248,9 @@ jobs:
           open -W -n "$APP" --args --shot "$OUT/shots-prompt"
           echo "open exit $?" | tee "$OUT/16-lsprompt.log"
           cat "$DATA/logs/app.log" >> "$OUT/16-lsprompt.log"
-          ls "$OUT/shots-prompt"
+          pkill -f LiveInterpreter; pkill -f lt-audio; true
 
-      - name: grant system-audio recording to the runner (TCC.db) and capture for real
+      - name: grant permissions to the runner (TCC.db) and capture system audio for real
         id: tap
         continue-on-error: true
         timeout-minutes: 10
@@ -287,42 +259,43 @@ jobs:
           H="$APP/Contents/MacOS/lt-audio"
           {
             csrutil status
-            pkill -f "LiveInterpreter" ; pkill -f "lt-audio"
             agent=$(ps -axo comm= | grep -m1 hosted-compute-agent); echo "agent: $agent"
+            py=$(python -c "import os, sys; print(os.path.realpath(sys.executable))")
             UDB="$HOME/Library/Application Support/com.apple.TCC/TCC.db"; SDB="/Library/Application Support/com.apple.TCC/TCC.db"
-            sqlite3 "$UDB" ".schema access" | head -3
-            sqlite3 "$UDB" "select service, client, client_type, auth_value from access" | head -40
             now=$(date +%s)
-            for db in "$UDB" "$SDB"; do
-              for c in "com.haoawake.live-interpreter|0" "$agent|1" "$APP/Contents/MacOS/lt-audio|1"; do
-                sudo sqlite3 "$db" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, flags, last_modified) VALUES ('kTCCServiceAudioCapture', '${c%|*}', ${c##*|}, 2, 4, 1, 0, $now);" && echo "granted ${c%|*} in $db"
+            grant() {  # service client client_type
+              for db in "$UDB" "$SDB"; do
+                sudo sqlite3 "$db" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, flags, last_modified) VALUES ('$1', '$2', $3, 2, 4, 1, 0, $now);" && echo "granted $1 to $2"
               done
+            }
+            grant kTCCServiceAudioCapture com.haoawake.live-interpreter 0
+            grant kTCCServiceAudioCapture "$agent" 1
+            for svc in kTCCServiceAccessibility kTCCServicePostEvent; do
+              grant $svc "$agent" 1; grant $svc "$py" 1; grant $svc org.python.python 0; grant $svc /bin/bash 1
             done
             killall tccd 2>/dev/null; sudo killall tccd 2>/dev/null; sleep 2
             echo "== devices"; "$H" devices
             echo "== tap while say plays"
             "$H" tap > tap.raw 2> tap.err & tp=$!
-            sleep 3; say -v Samantha "Testing the system audio tap. One, two, three, four, five."; sleep 2
+            sleep 3; say -v Samantha "Testing the system audio tap. One, two, three, four, five."; sleep 3
             kill $tp; wait $tp; cat tap.err
-            echo "== mic default, 4 s"
-            "$H" mic default > mic.raw 2> mic.err & p=$!; sleep 4; kill $p; wait $p; cat mic.err
             python - <<'EOF'
           import struct, numpy as np
-          for name in ("tap.raw", "mic.raw"):
-              data = open(name, "rb").read()
-              pos, n, rates, samples = 0, 0, set(), []
-              while pos + 12 <= len(data):
-                  magic, rate, frames = struct.unpack_from("<4sII", data, pos)
-                  assert magic == b"LTAU", (name, pos)
-                  samples.append(np.frombuffer(data, "<f4", frames, pos + 12))
-                  pos += 12 + frames * 4; n += 1; rates.add(rate)
-              a = np.concatenate(samples) if samples else np.zeros(0)
-              print(f"{name}: {n} packets, rates {rates}, {a.size / max(1, max(rates or {1})):.1f} s, "
-                    f"nonzero {np.count_nonzero(a)}, peak {np.abs(a).max() if a.size else 0:.4f}")
+          data = open("tap.raw", "rb").read()
+          pos, n, rates, samples = 0, 0, set(), []
+          while pos + 12 <= len(data):
+              magic, rate, frames = struct.unpack_from("<4sII", data, pos)
+              assert magic == b"LTAU", pos
+              samples.append(np.frombuffer(data, "<f4", frames, pos + 12))
+              pos += 12 + frames * 4; n += 1; rates.add(rate)
+          a = np.concatenate(samples) if samples else np.zeros(0)
+          print(f"tap.raw: {n} packets, rates {rates}, {a.size / 48000:.1f} s, nonzero {np.count_nonzero(a)}, "
+                f"peak {np.abs(a).max() if a.size else 0:.4f}")
           EOF
-            echo "== whole pipeline on system audio (packaged app, --listen) while afplay plays"
-            ( sleep 15; afplay speech.wav ) &
-            "$APP/Contents/MacOS/LiveInterpreter" --listen 50 2> "$OUT/17-listen-stderr.log"
+            echo "== whole pipeline on system audio (packaged app, --listen 45) while afplay plays"
+            ( sleep 12; afplay speech.wav ) &
+            "$APP/Contents/MacOS/LiveInterpreter" --listen 45 2> "$OUT/17-listen-stderr.log"
+            echo "listen exit $?"
             echo "== watchdog"
             bash -c 'sleep 300 & echo $! > child.pid; exec sleep 3' & parent=$!
             sleep 1; child=$(cat child.pid)
@@ -330,9 +303,8 @@ jobs:
             sleep 5
             if kill -0 $child 2>/dev/null; then echo "FAIL: child $child alive"; kill $child; else echo "OK: child killed after parent exit"; fi
             wait $wd; echo "watchdog exit $?"
-            echo "== 仅系统录音 pane"
-            plutil -p /System/Library/ExtensionKit/Extensions/SecurityPrivacyExtension.appex/Contents/Resources/zh_CN.lproj/PrivacySecurity.searchTerms 2>/dev/null | grep -B2 -A6 -i "AudioCapture" | head -30
           } 2>&1 | tee "$OUT/17-tap.log"
+          grep -q "ZH#" "$OUT/17-tap.log"
 
       - name: overlay on live system audio (LaunchServices launch, afplay)
         id: live
@@ -340,11 +312,101 @@ jobs:
         timeout-minutes: 5
         run: |
           set +e -o pipefail
-          mkdir -p "$OUT/shots-live" && echo 35,60,85 > "$OUT/shots-live/times.txt"
+          mkdir -p "$OUT/shots-live" && echo 40,75,110 > "$OUT/shots-live/times.txt"
           ( sleep 14; afplay speech-slow.wav ) &
           open -W -n "$APP" --args --shot "$OUT/shots-live"
           cp "$DATA/logs/app.log" "$OUT/18-live-app.log"
           ls "$OUT/shots-live"
+
+      - name: overlay stays over an app that goes full screen
+        id: fullscreen
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          set +e -o pipefail
+          for variant in panel accessory; do
+            d="$OUT/shots-fs-$variant"; mkdir -p "$d" && echo 30 > "$d/times.txt"
+            [ $variant = accessory ] && export LT_ACCESSORY=1
+            "$APP/Contents/MacOS/LiveInterpreter" --shot "$d" > "$d/app.log" 2>&1 &
+            app=$!
+            sleep 8
+            python - > "$d/fullscreen-helper.log" 2>&1 <<'EOF' &
+          import tkinter as tk
+          r = tk.Tk()
+          r.title("Full screen test")
+          r.configure(bg="#2d6a4f")
+          tk.Label(r, text="Another app in full screen", font=("Helvetica", 48), bg="#2d6a4f", fg="white").pack(expand=True)
+          r.after(500, lambda: r.attributes("-fullscreen", True))
+          r.after(60000, r.destroy)
+          r.mainloop()
+          EOF
+            fs=$!
+            sleep 10
+            screencapture -x "$d/fullscreen-now.png"
+            wait $app
+            kill $fs 2>/dev/null; sleep 3
+          done
+          true
+
+      - name: overlay interaction (synthetic clicks and drags)
+        id: ui
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set +e -o pipefail
+          unset LT_ACCESSORY
+          d="$OUT/shots-ui"; mkdir -p "$d" && echo 18,30 > "$d/times.txt"
+          "$APP/Contents/MacOS/LiveInterpreter" --shot "$d" > "$d/app.log" 2>&1 &
+          app=$!
+          for i in $(seq 1 30); do [ -f "$d/layout.json" ] && break; sleep 1; done
+          python - "$d" <<'EOF' 2>&1 | tee "$OUT/19-ui.log"
+          import ctypes, json, os, subprocess, sys, time
+          d = sys.argv[1]
+          L = json.load(open(os.path.join(d, "layout.json")))
+          print("layout", L)
+          cg = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+          class P(ctypes.Structure):
+              _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+          cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+          cg.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, P, ctypes.c_uint32]
+          cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+          cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
+          cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+          cg.CFRelease.argtypes = [ctypes.c_void_p]
+          def post(e):
+              cg.CGEventPost(0, e); cg.CFRelease(e); time.sleep(0.05)
+          def mouse(kind, x, y, button=0):
+              post(cg.CGEventCreateMouseEvent(None, kind, P(x, y), button))
+          def click(x, y):
+              mouse(5, x, y); time.sleep(0.2); mouse(1, x, y); time.sleep(0.1); mouse(2, x, y); time.sleep(0.5)
+          def drag(x0, y0, dx, dy):
+              mouse(5, x0, y0); time.sleep(0.2); mouse(1, x0, y0)
+              for i in range(1, 11):
+                  mouse(6, x0 + dx * i / 10, y0 + dy * i / 10); time.sleep(0.03)
+              mouse(2, x0 + dx, y0 + dy); time.sleep(0.6)
+          center = lambda b: (b[0] + b[2] / 2, b[1] + b[3] / 2)
+          x, y = center(L["buttons"]["暂停"]); print("click 暂停 at", x, y); click(x, y)
+          x, y = center(L["buttons"]["A+"]); print("click A+ twice"); click(x, y); click(x, y)
+          t = L["text"]; x0, y0 = t[0] + 60, t[1] + t[3] / 2
+          print("drag window by +120,-80"); drag(x0, y0, 120, -80)
+          g = L["grip"]
+          gx, gy = g[0] + 120 + g[2] / 2, g[1] - 80 + g[3] / 2
+          print("resize by +80,+40 from the grip"); drag(gx, gy, 80, 40)
+          print("right-click: settings menu"); mx, my = x0 + 120 + 40, y0 - 80
+          mouse(5, mx, my); mouse(3, mx, my, 1); time.sleep(0.1); mouse(4, mx, my, 1); time.sleep(1.5)
+          subprocess.run(["screencapture", "-x", os.path.join(d, "menu.png")])
+          post(cg.CGEventCreateKeyboardEvent(None, 53, True)); post(cg.CGEventCreateKeyboardEvent(None, 53, False))
+          print("done")
+          EOF
+          wait $app
+          python - "$d" <<'EOF' 2>&1 | tee -a "$OUT/19-ui.log"
+          import json, os, sys
+          d = sys.argv[1]
+          L = json.load(open(os.path.join(d, "layout.json")))
+          for name in ("live-1", "live-2"):
+              s = json.load(open(os.path.join(d, name + ".json")))
+              print(name, "pause:", s["pause"], "font:", s["font_size"], "rect:", s["rect"], "was:", L["window"])
+          EOF
 
       - name: collect logs
         if: always()
@@ -369,6 +431,7 @@ jobs:
           lsprompt=${{ steps.lsprompt.outcome }}
           tap=${{ steps.tap.outcome }}
           live=${{ steps.live.outcome }}
+          ui=${{ steps.ui.outcome }}
           EOF
           cat "$OUT/STEPS"
 

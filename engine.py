@@ -408,7 +408,7 @@ def main(argv=None):
 
     eng.set_source("file:" + wav if wav else cfg["source"])
     t0 = time.perf_counter()
-    finals = {}
+    finals, translated = {}, set()
     finished_at = None
     last_stats = None
     while True:
@@ -422,7 +422,9 @@ def main(argv=None):
                                     or args.listen and t > args.listen):
             finished_at = t
             print(f"{t:6.2f}s  [audio ended]")
-        if finished_at is not None and t - finished_at > 4 and eng._final_q.empty():
+        # done once every committed sentence has its translation (the runner's VM is slow)
+        if finished_at is not None and t - finished_at > 4 and (
+                len(translated) >= len(finals) or not cfg["translate"] or t - finished_at > 180):
             break
         if e is None:
             continue
@@ -431,6 +433,7 @@ def main(argv=None):
             finals[e[1]] = (t, e[3])
             print(f"{t:6.2f}s  FINAL#{e[1]}  {e[3]}")
         elif kind == "final_zh" and e[3]:
+            translated.add(e[1])
             print(f"{t:6.2f}s  ZH#{e[1]} (+{e[4]:.0f}ms)  {e[2]}")
         elif kind == "live" and args.all_events:
             print(f"{t:6.2f}s  live  {e[2]}")

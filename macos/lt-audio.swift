@@ -129,6 +129,8 @@ func othersPlaying() -> Bool {
     for obj in readArray(systemObject, kAudioHardwarePropertyProcessObjectList, of: AudioObjectID.self) {
         let pid = readValue(obj, kAudioProcessPropertyPID, pid_t(0)) ?? 0
         if pid == me || pid == parent { continue }
+        // recorders (another tap, a call) also keep an output device running: not playback
+        if (readValue(obj, kAudioProcessPropertyIsRunningInput, UInt32(0)) ?? 0) != 0 { continue }
         if (readValue(obj, kAudioProcessPropertyIsRunningOutput, UInt32(0)) ?? 0) != 0 { return true }
     }
     return false
@@ -332,12 +334,22 @@ final class Capture {
     func tick() {
         guard running else { return }
         let t = now()
-        if t - max(shared.lastCallback.pointee, startedAt) > 3 {
+        let last = shared.lastCallback.pointee
+        // a freshly started device may take a few seconds before its first callback
+        if (last < startedAt ? t - startedAt > 8 : t - last > 3) {
             restart("no audio callbacks")
             return
         }
-        // A denied tap is indistinguishable from silence except that other apps are playing.
-        if isTap, !warnedSilent, t - max(shared.lastSignal.pointee, startedAt) > 6, othersPlaying() {
+        guard isTap else { return }
+        let quiet = t - max(shared.lastSignal.pointee, startedAt)
+        if warnedSilent {
+            if quiet < 1 {  // sound again: the banner can go
+                warnedSilent = false
+                emit("signal")
+            }
+        } else if quiet > 8, TCC.preflight() != 0, othersPlaying() {
+            // Without the permission a tap delivers zeros and no error; other apps playing
+            // while nothing arrives is the only symptom (when TCC cannot be asked directly).
             warnedSilent = true
             emit("silent", ["others_playing": true, "permission": TCC.statusName])
         }

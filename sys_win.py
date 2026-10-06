@@ -162,6 +162,10 @@ def new_root(tk):
     return root
 
 
+def borderless(root):
+    root.overrideredirect(True)
+
+
 def make_app_window(root):
     """Give the frameless window a taskbar button so it can be minimized and found again.
     Returns the HWND, which the other window functions take."""

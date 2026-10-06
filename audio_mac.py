@@ -174,6 +174,8 @@ class Capture:
                 self.error = f"请在弹出的对话框中允许「同声传译」使用{which}"
             elif kind == "silent":
                 self.problem = "tap-silent"
+            elif kind == "signal" and self.problem == "tap-silent":
+                self.problem = None
             elif kind == "error":
                 code = ev.get("code", "")
                 if code in PROBLEMS:

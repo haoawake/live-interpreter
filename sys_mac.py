@@ -212,6 +212,18 @@ def new_root(tk):
     return root
 
 
+def borderless(root):
+    """A borderless *panel* that does not activate the app when clicked: unlike an ordinary
+    (overrideredirect) window, macOS lets such a panel float over other apps' full-screen
+    Spaces, so the captions stay on top of a full-screen video. Must run before mapping."""
+    try:
+        root.tk.call("::tk::unsupported::MacWindowStyle", "style", root._w, "utility",
+                     "noTitleBar nonActivating canJoinAllSpaces doesNotHide doesNotCycle")
+    except Exception:
+        log.exception("utility panel style failed, falling back to overrideredirect")
+        root.overrideredirect(True)
+
+
 def make_app_window(root):
     """Float the caption window over every Space and over full-screen apps, and keep it
     out of ⌘` cycling. Tk already made it borderless (overrideredirect) and topmost."""
@@ -224,6 +236,10 @@ def make_app_window(root):
         send(win, "setCollectionBehavior:", 1 | 16 | 64 | 256, argtypes=[c_ulong], restype=None)
         send(win, "setLevel:", 25, argtypes=[c_long], restype=None)  # NSStatusWindowLevel
         send(win, "setHasShadow:", True, argtypes=[c_bool], restype=None)
+        if send(win, "respondsToSelector:", _objc.sel_registerName(b"setHidesOnDeactivate:"), restype=c_bool):
+            send(win, "setHidesOnDeactivate:", False, argtypes=[c_bool], restype=None)  # panels hide by default
+        if os.environ.get("LT_ACCESSORY") == "1":  # experiment: no Dock icon / menu bar
+            send(nsapp(), "setActivationPolicy:", 1, argtypes=[c_long], restype=c_bool)
     except Exception:
         log.exception("window level setup failed")
     return win
@@ -235,6 +251,8 @@ def window_info(win):
         return {}
     return {
         "class": (_objc.object_getClassName(win) or b"").decode(),
+        "hidesOnDeactivate": send(win, "hidesOnDeactivate", restype=c_bool),
+        "activationPolicy": send(nsapp(), "activationPolicy", restype=c_long),
         "level": send(win, "level", restype=c_long),
         "collectionBehavior": send(win, "collectionBehavior", restype=c_ulong),
         "styleMask": send(win, "styleMask", restype=c_ulong),
