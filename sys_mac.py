@@ -216,21 +216,10 @@ def borderless(root):
     root.overrideredirect(True)
 
 
-def set_float_fullscreen(on):
-    """Other apps' full-screen Spaces only admit windows of "accessory" apps, i.e. apps
-    without a Dock icon or menu bar. Opt-in, because then the overlay's own right-click
-    menu is the only way to the settings."""
-    try:
-        send(nsapp(), "setActivationPolicy:", 1 if on else 0, argtypes=[c_long], restype=c_bool)
-        if not on:
-            activate()  # a regular app again: bring back its menu bar
-    except Exception:
-        log.exception("activation policy change failed")
-
-
 def make_app_window(root):
-    """Float the caption window over every Space and over full-screen apps, and keep it
-    out of ⌘` cycling. Tk already made it borderless (overrideredirect) and topmost."""
+    """Float the caption window over other windows on every Space and keep it out of ⌘`
+    cycling. (Other apps' native full-screen Spaces stay closed to it: tested in CI with a
+    status-level and a screen-saver-level window, as a regular and as an accessory app.) Tk already made it borderless (overrideredirect) and topmost."""
     root.attributes("-topmost", True)  # mapping a borderless window clears Tk's topmost flag
     win = ns_window(root)
     if not win:
@@ -238,8 +227,7 @@ def make_app_window(root):
     try:
         # CanJoinAllSpaces | Stationary | IgnoresCycle | FullScreenAuxiliary
         send(win, "setCollectionBehavior:", 1 | 16 | 64 | 256, argtypes=[c_ulong], restype=None)
-        level = int(os.environ.get("LT_WINDOW_LEVEL") or 25)  # NSStatusWindowLevel; env: CI experiment
-        send(win, "setLevel:", level, argtypes=[c_long], restype=None)
+        send(win, "setLevel:", 25, argtypes=[c_long], restype=None)  # NSStatusWindowLevel
         send(win, "setHasShadow:", True, argtypes=[c_bool], restype=None)
     except Exception:
         log.exception("window level setup failed")

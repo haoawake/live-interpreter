@@ -102,7 +102,6 @@ DEFAULTS = {
     "opacity": 0.9,
     "lines": -1,  # finished sentences shown above the live one; -1 = as many as fit
     "save_transcript": True,
-    "float_fullscreen": False,  # macOS: accessory app, so the overlay shows over full-screen apps
     "geometry": "",
 }
 

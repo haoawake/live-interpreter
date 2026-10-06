@@ -30,7 +30,7 @@ These components are included in `同声传译.app/Contents/Frameworks` and `Res
 |---|---|---|---|---|
 | CPython runtime (python.org macOS build) | 3.12.10 | Python Software Foundation License 2.0 | `licenses/Python.txt` | https://www.python.org |
 | Tcl/Tk (Aqua) | 8.6.16 | Tcl/Tk License (BSD-style) | `licenses/Tcl-Tk.txt` | https://www.tcl.tk |
-| OpenSSL (used by CPython) | 3.0 | Apache License 2.0 | `licenses/Apache-2.0.txt` | https://www.openssl.org |
+| OpenSSL (used by CPython) | 3.0.16 | Apache License 2.0 | `licenses/Apache-2.0.txt` | https://www.openssl.org |
 | NumPy (built against Apple Accelerate) | 2.5.3 | BSD-3-Clause, plus the licenses of its bundled components | `licenses/NumPy.txt` | https://numpy.org |
 | sherpa-onnx | 1.13.8 | Apache License 2.0 | `licenses/sherpa-onnx.txt` | https://github.com/k2-fsa/sherpa-onnx |
 | ONNX Runtime (shipped with sherpa-onnx) | 1.28.2 | MIT License | `licenses/ONNX-Runtime.txt` | https://github.com/microsoft/onnxruntime |
