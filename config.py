@@ -72,6 +72,7 @@ MT_MODELS = {
 LLAMA_BUILD = "b11269"
 LLAMA_DIR = "bin/llama"
 LLAMA_SERVER = LLAMA_DIR + ("/llama-server" if MAC else "/llama-server.exe")
+GPU_NAME = "Metal" if MAC else "GPU"  # shown as 翻译就绪 · GPU
 GLOSSARY_PATH = "glossary.txt"
 TRANSCRIPT_DIR = "transcripts"
 LOG_DIR = "logs"

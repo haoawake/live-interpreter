@@ -22,10 +22,19 @@ SYSTEM_DEFAULT = "loopback:default"
 MIC_DEFAULT = "mic:default"
 _HEADER = struct.Struct("<4sII")
 
-# Where the user grants each permission (系统设置 → 隐私与安全性 → ...)
+def _macos():
+    try:
+        return tuple(int(x) for x in platform.mac_ver()[0].split(".")[:2])
+    except ValueError:
+        return (0, 0)
+
+
+# Where the user grants each permission (系统设置 → 隐私与安全性 → ...). macOS 15 has its
+# own anchor for 「仅系统录音」; on 14.x that list sits in the screen-recording pane.
+_PANE = "x-apple.systempreferences:com.apple.preference.security?"
 SETTINGS_URL = {
-    "tap": "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
-    "mic": "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+    "tap": _PANE + ("Privacy_AudioCapture" if _macos() >= (15, 0) else "Privacy_ScreenCapture"),
+    "mic": _PANE + "Privacy_Microphone",
 }
 PROBLEMS = {  # helper error code -> (permission kind, message shown in the overlay)
     "tap-denied": ("tap", "没有录制系统声音的权限：请在「系统设置 › 隐私与安全性 › 录屏与系统录音」"
@@ -42,11 +51,7 @@ _ERRORS = {
 
 
 def tap_supported():
-    try:
-        v = tuple(int(x) for x in platform.mac_ver()[0].split(".")[:2])
-    except ValueError:
-        return False
-    return v >= (14, 2)
+    return _macos() >= (14, 2)
 
 
 def helper():

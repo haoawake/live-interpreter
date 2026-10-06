@@ -28,12 +28,11 @@ _HF, _HF_MIRROR = "https://huggingface.co/", "https://hf-mirror.com/"
 
 def _ssl_context():
     """python.org's macOS Python has no CA store of its own (the frozen app even less so):
-    use certifi's. Windows Python reads the system store."""
-    if not config.MAC:
+    use the bundle macOS itself ships for LibreSSL. Windows Python reads the system store."""
+    if not config.MAC or not os.path.exists("/etc/ssl/cert.pem"):
         return None
     try:
-        import certifi
-        return ssl.create_default_context(cafile=certifi.where())
+        return ssl.create_default_context(cafile="/etc/ssl/cert.pem")
     except Exception:
         return None
 

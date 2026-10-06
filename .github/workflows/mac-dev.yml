@@ -38,7 +38,7 @@ jobs:
             sw_vers; uname -a; sysctl -n machdep.cpu.brand_string hw.memsize hw.perflevel0.physicalcpu hw.ncpu
             xcrun swiftc --version; xcodebuild -version
             python -c "import sys, tkinter; print(sys.version); r = tkinter.Tcl(); print('tcl', r.eval('info patchlevel'))"
-            python -c "import _tkinter, sys; print(_tkinter.__file__)"
+            python -c "import _tkinter, ssl; print(_tkinter.__file__, ssl.OPENSSL_VERSION)"
             otool -L "$(python -c 'import _tkinter; print(_tkinter.__file__)')"
             system_profiler SPDisplaysDataType SPAudioDataType
           } 2>&1 | tee "$OUT/00-environment.log"
@@ -100,6 +100,8 @@ jobs:
             codesign --verify --deep --strict --verbose=2 "$X" && echo "CODESIGN OK (extracted)"
             "$X/Contents/MacOS/LiveInterpreter" --selftest "$OUT/selftest.json"; echo "selftest exit $?"
             cat "$OUT/selftest.json"
+            open -W -n "$X" --args --selftest "$OUT/selftest-open.json"; echo "open exit $?"
+            python -c "import json; d=json.load(open('$OUT/selftest-open.json')); print('via open:', d['ok'], d['executable'])"
           } 2>&1 | tee "$OUT/05-selftest.log"
           python -c "import json,sys; sys.exit(0 if json.load(open('$OUT/selftest.json'))['ok'] else 1)"
 
@@ -170,7 +172,7 @@ jobs:
           } 2>&1 | tee -a "$OUT/08-llama.log"
           rm -rf "$DATA/bin" && cp -a "$LT_DATA_DIR/bin" "$DATA/bin"
 
-      - name: English speech sample
+      - name: English speech samples
         run: |
           cat > speech.txt <<'EOF'
           Good morning, everyone. Today we are going to talk about how neural networks learn to translate.
@@ -180,9 +182,13 @@ jobs:
           Finally, fine-tuning on a small dataset makes the model useful for a specific course.
           If you have any questions, please raise your hand. Thank you for listening.
           EOF
-          say -v Samantha -r 170 -o speech.aiff -f speech.txt || say -o speech.aiff -f speech.txt
-          afconvert -f WAVE -d LEI16@16000 -c 1 speech.aiff speech.wav
-          afinfo speech.wav | tee "$OUT/09-speech.log"
+          # the runner's VM translates slowly; pauses let every sentence finish for the screenshots
+          sed 's/\. /. [[slnc 6000]] /g' speech.txt > speech-slow.txt
+          for n in speech speech-slow; do
+            say -v Samantha -r 170 -o $n.aiff -f $n.txt || say -o $n.aiff -f $n.txt
+            afconvert -f WAVE -d LEI16@16000 -c 1 $n.aiff $n.wav
+          done
+          afinfo speech.wav speech-slow.wav | grep -i duration | tee "$OUT/09-speech.log"
 
       - name: pipeline on the packaged app (CPU)
         id: cpu
@@ -221,28 +227,88 @@ jobs:
             if pgrep -f bin/llama/llama-server; then echo "FAIL: llama-server survived"; pkill -9 -f bin/llama/llama-server; exit 1; else echo "OK: llama-server gone"; fi
           } 2>&1 | tee "$OUT/12-orphan.log"
 
-      - name: audio helper
-        id: helper
+      - name: overlay with captions (packaged app, test WAV)
+        id: overlay
         continue-on-error: true
-        timeout-minutes: 6
+        timeout-minutes: 8
+        run: |
+          set -o pipefail
+          "$APP/Contents/MacOS/LiveInterpreter" --test-wav speech-slow.wav --shot "$OUT/shots" 2>&1 | tee "$OUT/14-overlay.log"
+          cp "$DATA/logs/app.log" "$OUT/14-app.log" || true
+          ls -la "$OUT/shots"
+
+      - name: overlay stays over an app that goes full screen
+        id: fullscreen
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          set +e -o pipefail
+          mkdir -p "$OUT/shots-fs"
+          # the overlay first (as a user would have it), then another app enters full screen
+          "$APP/Contents/MacOS/LiveInterpreter" --test-wav speech-slow.wav --shot "$OUT/shots-fs" > "$OUT/15-fullscreen.log" 2>&1 &
+          app=$!
+          sleep 12
+          python - > "$OUT/15-fullscreen-helper.log" 2>&1 <<'EOF' &
+          import tkinter as tk
+          r = tk.Tk()
+          r.title("Full screen test")
+          r.configure(bg="#2d6a4f")
+          tk.Label(r, text="Another app in full screen", font=("Helvetica", 48), bg="#2d6a4f", fg="white").pack(expand=True)
+          r.after(500, lambda: r.attributes("-fullscreen", True))
+          r.after(240000, r.destroy)
+          r.mainloop()
+          EOF
+          fs=$!
+          sleep 8
+          screencapture -x "$OUT/shots-fs/fullscreen-now.png"
+          wait $app
+          kill $fs 2>/dev/null
+          true
+
+      - name: launched by LaunchServices (permission prompt names the app)
+        id: lsprompt
+        continue-on-error: true
+        timeout-minutes: 4
+        run: |
+          set +e -o pipefail
+          mkdir -p "$OUT/shots-prompt" && echo 20 > "$OUT/shots-prompt/times.txt"
+          # system audio is the saved source; nobody can answer the TCC prompt, so this shows it
+          open -W -n "$APP" --args --shot "$OUT/shots-prompt"
+          echo "open exit $?" | tee "$OUT/16-lsprompt.log"
+          cat "$DATA/logs/app.log" >> "$OUT/16-lsprompt.log"
+          ls "$OUT/shots-prompt"
+
+      - name: grant system-audio recording to the runner (TCC.db) and capture for real
+        id: tap
+        continue-on-error: true
+        timeout-minutes: 10
         run: |
           set +e -o pipefail
           H="$APP/Contents/MacOS/lt-audio"
           {
+            csrutil status
+            pkill -f "LiveInterpreter" ; pkill -f "lt-audio"
+            agent=$(ps -axo comm= | grep -m1 hosted-compute-agent); echo "agent: $agent"
+            UDB="$HOME/Library/Application Support/com.apple.TCC/TCC.db"; SDB="/Library/Application Support/com.apple.TCC/TCC.db"
+            sqlite3 "$UDB" ".schema access" | head -3
+            sqlite3 "$UDB" "select service, client, client_type, auth_value from access" | head -40
+            now=$(date +%s)
+            for db in "$UDB" "$SDB"; do
+              for c in "com.haoawake.live-interpreter|0" "$agent|1" "$APP/Contents/MacOS/lt-audio|1"; do
+                sudo sqlite3 "$db" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, flags, last_modified) VALUES ('kTCCServiceAudioCapture', '${c%|*}', ${c##*|}, 2, 4, 1, 0, $now);" && echo "granted ${c%|*} in $db"
+              done
+            done
+            killall tccd 2>/dev/null; sudo killall tccd 2>/dev/null; sleep 2
             echo "== devices"; "$H" devices
-            echo "== tap --no-request while say plays"
-            "$H" tap --no-request > tap.raw 2> tap.err & tp=$!
-            sleep 2; say -v Samantha "Testing the system audio tap. One, two, three, four, five." ; sleep 2
-            kill $tp; wait $tp; echo "tap exit $?"; cat tap.err
-            echo "== tap (with permission request, 20 s)"
-            ( "$H" tap > tap2.raw 2> tap2.err & p=$!; sleep 6; say "Second test of the tap."; sleep 14; kill $p 2>/dev/null; wait $p; echo "exit $?" )
-            cat tap2.err
-            echo "== mic default, 5 s"
-            ( "$H" mic default > mic.raw 2> mic.err & p=$!; sleep 5; kill $p 2>/dev/null; wait $p; echo "exit $?" )
-            cat mic.err
+            echo "== tap while say plays"
+            "$H" tap > tap.raw 2> tap.err & tp=$!
+            sleep 3; say -v Samantha "Testing the system audio tap. One, two, three, four, five."; sleep 2
+            kill $tp; wait $tp; cat tap.err
+            echo "== mic default, 4 s"
+            "$H" mic default > mic.raw 2> mic.err & p=$!; sleep 4; kill $p; wait $p; cat mic.err
             python - <<'EOF'
           import struct, numpy as np
-          for name in ("tap.raw", "tap2.raw", "mic.raw"):
+          for name in ("tap.raw", "mic.raw"):
               data = open(name, "rb").read()
               pos, n, rates, samples = 0, 0, set(), []
               while pos + 12 <= len(data):
@@ -251,10 +317,12 @@ jobs:
                   samples.append(np.frombuffer(data, "<f4", frames, pos + 12))
                   pos += 12 + frames * 4; n += 1; rates.add(rate)
               a = np.concatenate(samples) if samples else np.zeros(0)
-              print(f"{name}: {len(data)} bytes, {n} packets, rates {rates}, {a.size} samples, "
-                    f"nonzero {np.count_nonzero(a)}, peak {np.abs(a).max() if a.size else 0:.4f}, "
-                    f"rms {np.sqrt(np.mean(a**2)) if a.size else 0:.5f}")
+              print(f"{name}: {n} packets, rates {rates}, {a.size / max(1, max(rates or {1})):.1f} s, "
+                    f"nonzero {np.count_nonzero(a)}, peak {np.abs(a).max() if a.size else 0:.4f}")
           EOF
+            echo "== whole pipeline on system audio (packaged app, --listen) while afplay plays"
+            ( sleep 15; afplay speech.wav ) &
+            "$APP/Contents/MacOS/LiveInterpreter" --listen 50 2> "$OUT/17-listen-stderr.log"
             echo "== watchdog"
             bash -c 'sleep 300 & echo $! > child.pid; exec sleep 3' & parent=$!
             sleep 1; child=$(cat child.pid)
@@ -262,44 +330,21 @@ jobs:
             sleep 5
             if kill -0 $child 2>/dev/null; then echo "FAIL: child $child alive"; kill $child; else echo "OK: child killed after parent exit"; fi
             wait $wd; echo "watchdog exit $?"
-            echo "== settings pane anchors"
-            for a in Privacy_AudioCapture Privacy_ScreenCapture Privacy_Microphone; do
-              printf '%s: ' $a; grep -rl "$a" /System/Library/ExtensionKit/Extensions/*.appex/Contents/Info.plist /System/Library/ExtensionKit/Extensions/*Privacy*.appex 2>/dev/null | head -3 | tr '\n' ' '; echo
-            done
-          } 2>&1 | tee "$OUT/13-helper.log"
+            echo "== 仅系统录音 pane"
+            plutil -p /System/Library/ExtensionKit/Extensions/SecurityPrivacyExtension.appex/Contents/Resources/zh_CN.lproj/PrivacySecurity.searchTerms 2>/dev/null | grep -B2 -A6 -i "AudioCapture" | head -30
+          } 2>&1 | tee "$OUT/17-tap.log"
 
-      - name: overlay with captions (packaged app, test WAV)
-        id: overlay
+      - name: overlay on live system audio (LaunchServices launch, afplay)
+        id: live
         continue-on-error: true
-        timeout-minutes: 8
-        run: |
-          set -o pipefail
-          "$APP/Contents/MacOS/LiveInterpreter" --test-wav speech.wav --shot "$OUT/shots" 2>&1 | tee "$OUT/14-overlay.log"
-          cp "$DATA/logs/app.log" "$OUT/14-app.log" || true
-          ls -la "$OUT/shots"
-
-      - name: overlay over a full-screen app
-        id: fullscreen
-        continue-on-error: true
-        timeout-minutes: 8
+        timeout-minutes: 5
         run: |
           set +e -o pipefail
-          mkdir -p "$OUT/shots-fs"
-          python - > "$OUT/15-fullscreen-helper.log" 2>&1 <<'EOF' &
-          import tkinter as tk
-          r = tk.Tk()
-          r.title("Full screen test")
-          r.configure(bg="#2d6a4f")
-          tk.Label(r, text="Another app in full screen", font=("Helvetica", 48), bg="#2d6a4f", fg="white").pack(expand=True)
-          r.after(800, lambda: r.attributes("-fullscreen", True))
-          r.after(150000, r.destroy)
-          r.mainloop()
-          EOF
-          fs=$!
-          sleep 6
-          screencapture -x "$OUT/shots-fs/before.png"
-          "$APP/Contents/MacOS/LiveInterpreter" --test-wav speech.wav --shot "$OUT/shots-fs" 2>&1 | tee "$OUT/15-fullscreen.log"
-          kill $fs 2>/dev/null || true
+          mkdir -p "$OUT/shots-live" && echo 35,60,85 > "$OUT/shots-live/times.txt"
+          ( sleep 14; afplay speech-slow.wav ) &
+          open -W -n "$APP" --args --shot "$OUT/shots-live"
+          cp "$DATA/logs/app.log" "$OUT/18-live-app.log"
+          ls "$OUT/shots-live"
 
       - name: collect logs
         if: always()
@@ -319,9 +364,11 @@ jobs:
           cpu=${{ steps.cpu.outcome }}
           metal=${{ steps.metal.outcome }}
           orphan=${{ steps.orphan.outcome }}
-          helper=${{ steps.helper.outcome }}
           overlay=${{ steps.overlay.outcome }}
           fullscreen=${{ steps.fullscreen.outcome }}
+          lsprompt=${{ steps.lsprompt.outcome }}
+          tap=${{ steps.tap.outcome }}
+          live=${{ steps.live.outcome }}
           EOF
           cat "$OUT/STEPS"
 

@@ -174,6 +174,9 @@ class App:
         self.engine.start(source=False if test_wav else None)
         root.after(30, self._poll)
         root.after(1000, self._status_tick)
+        if shot_dir and not test_wav:  # CI, live audio: shots at fixed times, then quit
+            self._shots_started = time.time()
+            self.root.after(500, self._live_shot_tick)
 
     # ---- window ------------------------------------------------------------
 
@@ -451,7 +454,7 @@ class App:
         if self.paused:
             return "已暂停，点「继续」恢复"
         menu = "（右键或双指轻点打开设置）" if MAC else "（右键打开设置）"
-        if self.cfg["source"].startswith("mic:"):
+        if self.cfg["source"].startswith("mic:") or (MAC and not audio_mac.tap_supported()):
             return "正在聆听麦克风…  对着麦克风说英文即可看到同传字幕" + menu
         return "正在聆听电脑播放的声音…  播放英文即可看到同传字幕" + menu
 
@@ -774,11 +777,32 @@ class App:
             subprocess.run(["screencapture", "-x", os.path.join(self.shot_dir, name + "-screen.png")],
                            timeout=20, capture_output=True)
             info = {"window": plat.window_info(plat.ns_window(widget or self.root)), "rect": self._rect(),
-                    "entries": [(e.en, e.zh) for e in self.entries], "live": [self.live_en, self.live_zh]}
+                    "entries": [(e.en, e.zh) for e in self.entries], "live": [self.live_en, self.live_zh],
+                    "status": self.status_lbl.cget("text"), "stats": self.stats, "banner": self._banner_for,
+                    "menus": plat.menu_titles() if hasattr(plat, "menu_titles") else None}
             with open(os.path.join(self.shot_dir, name + ".json"), "w", encoding="utf-8") as f:
                 json.dump(info, f, ensure_ascii=False, indent=1)
         except Exception:
             log.exception("screenshot failed")
+
+    def _live_shot_tick(self):
+        """Screenshots this many seconds after start ("<shot dir>/times.txt", as "30,60"; `open`
+        passes no environment), then quit."""
+        try:
+            with open(os.path.join(self.shot_dir, "times.txt")) as f:
+                spec = f.read()
+        except OSError:
+            spec = "25,55"
+        times = [float(x) for x in spec.split(",")]
+        elapsed = time.time() - self._shots_started
+        taken = getattr(self, "_live_taken", 0)
+        if taken < len(times) and elapsed >= times[taken]:
+            self._shot(f"live-{taken + 1}")
+            self._live_taken = taken = taken + 1
+        if taken >= len(times):
+            self.quit()
+            return
+        self.root.after(500, self._live_shot_tick)
 
     def _shot_tick(self):
         elapsed = time.time() - self._shots_started
@@ -831,6 +855,10 @@ class SetupWindow:
         self.summary = tk.Label(win, font=(UI_FONT, F(10)), fg=EN, **text)
         self.summary.pack(fill="x", padx=pad)
         self.bg = bg
+        if MAC and "/AppTranslocation/" in sys.executable:
+            # Opened straight from 下载 (or the zip): macOS runs a read-only copy from a random path
+            tk.Label(win, text="提示：建议先退出，把「同声传译」拖进「应用程序」文件夹后再打开。",
+                     font=(UI_FONT, F(10)), fg=YELLOW, **text).pack(fill="x", padx=pad, pady=(6, 0))
         self.items = tk.Frame(win, bg=bg)
         self.items.pack(fill="x", padx=pad, pady=(10, 6))
         self.mirror = tk.BooleanVar(value=False)

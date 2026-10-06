@@ -162,11 +162,18 @@ def ns_window(widget):
     """
     try:
         widget.update_idletasks()
+        windows = send(nsapp(), "windows")
+        all_windows = [send(windows, "objectAtIndex:", i, argtypes=[c_ulong])
+                       for i in range(send(windows, "count", restype=c_ulong) or 0)]
+        # Tk titles the NSWindow when it is first mapped, borderless ones included, and
+        # our titles are unique.
+        title = widget.wm_title()
+        named = [w for w in all_windows if pystring(send(w, "title")) == title]
+        if len(named) == 1:
+            return named[0]
         drawable = int(widget.winfo_id())
         view = c_void_p.from_address(drawable + ctypes.sizeof(c_void_p)).value
-        windows = send(nsapp(), "windows")
-        for i in range(send(windows, "count", restype=c_ulong)):
-            w = send(windows, "objectAtIndex:", i, argtypes=[c_ulong])
+        for w in all_windows:
             if view and send(w, "contentView") == view:
                 return w
     except Exception:
@@ -174,12 +181,15 @@ def ns_window(widget):
     return None
 
 
-def appearance(widget, name="darkaqua"):
-    """Dark title bar and native controls to match our dark windows (Tk 8.6.10+)."""
+def dark_appearance():
+    """Every window of ours is dark (the captions, the transcript, the setup window), so
+    the whole app is pinned to Dark Aqua: title bars, native buttons, scrollers and menus
+    then match in light and dark system mode alike."""
     try:
-        widget.tk.call("::tk::unsupported::MacWindowStyle", "appearance", widget._w, name)
+        dark = send(cls("NSAppearance"), "appearanceNamed:", nsstring("NSAppearanceNameDarkAqua"))
+        send(nsapp(), "setAppearance:", dark, restype=None)
     except Exception:
-        log.warning("appearance %s not supported", name)
+        log.exception("dark appearance failed")
 
 
 def set_window_icon(widget):
@@ -187,13 +197,13 @@ def set_window_icon(widget):
 
 
 def style_window(widget):
-    appearance(widget)
+    pass  # see dark_appearance()
 
 
 def new_root(tk):
     root = tk.Tk()
     root.withdraw()  # shown once it is styled; an Aqua toplevel flashes otherwise
-    appearance(root)
+    dark_appearance()
     if not config.FROZEN:  # the Dock would show Python's rocket
         try:
             root.iconphoto(True, tk.PhotoImage(file=config.ICON_PATH))
@@ -339,6 +349,22 @@ def localize_app_menu():
                 send(it, "setTitle:", nsstring(title), restype=None)
     except Exception:
         log.exception("menu localisation failed")
+
+
+def menu_titles():
+    """{menu: [item titles]} of the menu bar as Cocoa shows it (CI checks the translations)."""
+    out = {}
+    main = send(nsapp(), "mainMenu")
+    for i in range(send(main, "numberOfItems", restype=c_long) or 0):
+        item = send(main, "itemAtIndex:", i, argtypes=[c_long])
+        sub = send(item, "submenu")
+        titles = []
+        for j in range(send(sub, "numberOfItems", restype=c_long) or 0):
+            it = send(sub, "itemAtIndex:", j, argtypes=[c_long])
+            if not send(it, "isSeparatorItem", restype=c_bool):
+                titles.append(pystring(send(it, "title")) + ("" if not send(it, "isHidden", restype=c_bool) else " (hidden)"))
+        out[pystring(send(item, "title")) or pystring(send(sub, "title"))] = titles
+    return out
 
 
 def snapshot(widget, path):

@@ -171,7 +171,7 @@ class Engine:
                     self.events.put(("error", f"翻译引擎启动失败：{e}"))
                     return
                 self.server, self.translator = server, translator
-                self.events.put(("status", "mt", f"翻译就绪 · {'GPU' if server.gpu else 'CPU'}"))
+                self.events.put(("status", "mt", f"翻译就绪 · {config.GPU_NAME if server.gpu else 'CPU'}"))
         threading.Thread(target=run, daemon=True).start()
 
     # ---- ASR loop --------------------------------------------------------
@@ -369,7 +369,10 @@ def main(argv=None):
     import sys
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wav", required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--wav", help="16-bit WAV played into the pipeline in real time")
+    src.add_argument("--listen", type=float, metavar="SECONDS",
+                     help="capture the saved audio source (system audio by default) for this long")
     ap.add_argument("--asr", default="160")
     ap.add_argument("--mt", default="q4")
     ap.add_argument("--cpu", action="store_true", help="translate on CPU")
@@ -377,8 +380,9 @@ def main(argv=None):
     ap.add_argument("--all-events", action="store_true", help="also print live/streaming updates")
     ap.add_argument("--threads", type=int, help="ASR threads (default: the saved setting)")
     args = ap.parse_args(argv)
-    wav = os.path.abspath(args.wav)
+    wav = os.path.abspath(args.wav) if args.wav else None
     os.chdir(config.APP_DIR)
+    config.ensure_glossary()
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -402,10 +406,11 @@ def main(argv=None):
             raise SystemExit("engine did not become ready")
     print(f"ready in {time.perf_counter() - t_ready:.1f}s")
 
-    eng.set_source("file:" + wav)
+    eng.set_source("file:" + wav if wav else cfg["source"])
     t0 = time.perf_counter()
     finals = {}
     finished_at = None
+    last_stats = None
     while True:
         try:
             e = events.get(timeout=0.05)
@@ -413,7 +418,8 @@ def main(argv=None):
             e = None
         t = time.perf_counter() - t0
         cap = eng.capture
-        if finished_at is None and isinstance(cap, FileSource) and cap.finished.is_set():
+        if finished_at is None and (isinstance(cap, FileSource) and cap.finished.is_set()
+                                    or args.listen and t > args.listen):
             finished_at = t
             print(f"{t:6.2f}s  [audio ended]")
         if finished_at is not None and t - finished_at > 4 and eng._final_q.empty():
@@ -433,8 +439,11 @@ def main(argv=None):
                 print(f"{t:6.2f}s  live_zh  {e[3]}")
         elif kind in ("error", "status"):
             print(f"{t:6.2f}s  {e}")
-        elif kind == "stats" and args.all_events:
-            print(f"{t:6.2f}s  stats {e[1]}")
+        elif kind == "stats":
+            key = tuple(e[1].get(k) for k in ("device", "audio_error", "audio_problem"))
+            if args.all_events or (args.listen and key != last_stats):
+                print(f"{t:6.2f}s  stats {e[1]}")
+            last_stats = key
     eng.shutdown()
 
 

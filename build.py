@@ -85,6 +85,7 @@ def build_windows(stage=None):
         "--collect-all", "sherpa_onnx",  # its onnxruntime/sherpa DLLs sit next to the .pyd
         "--collect-data", "soundcard",  # the cffi header soundcard parses at import
         "--exclude-module", "PIL", "--exclude-module", "pyflakes",
+        "--exclude-module", "click",  # only sherpa-onnx's own command line uses it
         "--exclude-module", "sys_mac", "--exclude-module", "audio_mac",
         "--distpath", os.path.join(WORK, "dist"), "--workpath", os.path.join(WORK, "work"),
         "--specpath", WORK, os.path.join(ROOT, "app.py"),
@@ -233,8 +234,7 @@ def build_mac(stage):
         "--add-data", f"{os.path.join(ROOT, 'assets', 'icon.png')}{sep}assets",
         "--add-data", f"{os.path.join(ROOT, 'glossary.txt')}{sep}.",
         "--collect-all", "sherpa_onnx",
-        "--collect-data", "certifi",
-        "--exclude-module", "PIL", "--exclude-module", "pyflakes",
+        "--exclude-module", "PIL", "--exclude-module", "pyflakes", "--exclude-module", "click",
         "--exclude-module", "sys_win", "--exclude-module", "audio_win",
         "--exclude-module", "pyaudiowpatch", "--exclude-module", "soundcard",
         "--distpath", os.path.join(work, "dist"), "--workpath", os.path.join(work, "pyi"),
